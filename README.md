@@ -19,7 +19,33 @@ rather than a library it links against.
 
 | Header | What it holds |
 |---|---|
+| `amp_comp.h` | Amp-comp calibration tables and quadratic window eval |
+| `autotune.h` | Calibration state, enums, prototypes; pulls in the three below |
+| `autotune_constants.h` | Calibration constants and the NORMAL / FINE / FAST precision profiles |
+| `autotune_context.h` | `DCOCalibrationContext` |
+| `autotune_measurement.h` | `find_gap()` declaration and the `measure_gap()` wrapper |
+| `autotune_impl.h` | Definitions: run orchestration, PW searches, `find_gap()`. Include once |
+| `autotune_search_impl.h` | Definitions: amp-comp search, FREQ_TRACE, endpoints. Include once |
+| `bench.h` | Hot-path profiler; DCO3-only probes/report via `PROJECT_INSTRUMENT` |
+| `character_jitter.h` | Character-tab noise jitter scales (pitch / amp / PW) |
+| `clkdiv.h` | PIO clock-divider total-cycle helpers (`CLKDIV_MODE`) |
+| `cv_bezier.h` | Bézier helpers for the AS2164 VCA linearize table |
+| `cv_out.h` | Software CV math prototypes |
+| `mem_diag.h` | SRAM / heap / stack snapshot prototypes |
+| `midi.h` | USB and serial MIDI instances |
+| `midi_cc.h` | 7-bit MIDI CC control surface |
+| `midi_cc_map.h` | Generated `MidiCcEntry` table (from `gen_midi_map.py`) |
+| `noise.h` | Sketch-side `DcoNoiseGen` objects |
+| `noteList.h` | MIDI note Hz / Q24 tables (`__not_in_flash("pitch_tables")`) |
+| `PWM.h` | RANGE / CV / level PWM writers |
+| `range_pwm_dither.pio.h` | Generated PIO program for RANGE dither |
+| `tusb_config.h` | TinyUSB config (sketch keeps a same-name shim) |
+| `utils.h` | Log / exp mapping prototypes |
 | `voice_alloc.h` | `VoiceAllocator` (poly voice stealing) and `MonoNoteStack` (mono note priority) |
+| `voices.h` | Voice init and portamento state |
+| `wave_mux.h` | 74HC595 wave-select prototypes |
+| `docs/AUTOTUNE.md` | Shared autotune algorithms, file layout, DCO3/DCO4 hardware table |
+| `docs/CALIBRATION_PROCEDURE.md` | Operator calibration bring-up |
 
 ## How a sketch consumes it
 
@@ -35,6 +61,63 @@ DCO/_shared -> ../../DCO-SHARED-LIBRARIES
 ```
 
 Header-only, so there is nothing to add to the build command.
+
+---
+
+# autotune — DCO amp-comp and PW calibration
+
+The whole calibration subsystem: the amp-comp table build (classic per-note
+search and FREQ_TRACE curve tracing), the refine pass over a stored table, the
+PW center and limit searches, and the edge-timing duty measurement they all run
+on. Six headers, split into declarations and definitions. Algorithms:
+[`docs/AUTOTUNE.md`](docs/AUTOTUNE.md). Operator workflow:
+[`docs/CALIBRATION_PROCEDURE.md`](docs/CALIBRATION_PROCEDURE.md).
+
+## Layout
+
+| Header | Include it |
+|---|---|
+| `autotune.h` | From the sketch, wherever calibration state or prototypes are needed. Pulls in `autotune_constants.h`, `autotune_measurement.h` and `autotune_context.h`, so those need no shim of their own. |
+| `autotune_impl.h` | **Exactly once**, from `DCO/autotune.ino`. |
+| `autotune_search_impl.h` | **Exactly once**, from `DCO/autotune_search.ino`, which sorts after `autotune.ino`. |
+
+The two `*_impl.h` carry definitions, not declarations. They live behind `.ino`
+shims rather than being included from a header because arduino-cli merges the
+sketch's `.ino` files alphabetically into one translation unit: keeping the shim
+names is what preserves that order, and with it the visibility of each file's
+`static` helpers to the one after it.
+
+That also means the Arduino prototype generator no longer sees these functions -
+it only scans `.ino` files - so everything called across the boundary is
+declared in `autotune.h`, and the file-scope statics used before their
+definition are forward-declared at the top of each `*_impl.h`. A function added
+to an `*_impl.h` and called from anywhere earlier needs a declaration written by
+hand.
+
+## What the sketch has to provide
+
+`autotune.h` and both `*_impl.h` start with `#include "../include_all.h"`, which
+resolves to the sketch's own `include_all.h` when reached through `DCO/_shared/`.
+Through it the calibration code expects, from the board:
+
+- topology and pins in `globals.h`: `NUM_OSCILLATORS`, `NUM_VOICES_TOTAL`,
+  `NUM_PW_CHANNELS`, `DIV_COUNTER`, `DCO_calibration_pin`, `RANGE_*`, `PW_*`,
+  `VOICE_TO_PIO/SM`
+- `voice_task_autotune()` (drives one oscillator at `calibrationFreqHz`)
+- `start_voice_sms()`, to restart the PIO state machines afterwards
+- the LittleFS writers `update_FS_voice()`, `update_FS_PW*()`,
+  `update_FS_AmpComp440()`, and `chanLevelVoiceDataSize`
+- `serialSendParam32()` and `PARAM_GAP_FROM_DCO`
+- `amp_comp.h`, `PWM.h` and `noteList.h` from this repo
+
+## Consumers
+
+Both sketches consume this library via `DCO/_shared`.
+
+- [DCO3-MONOSYNTH](https://github.com/felipegaspari/DCO3-MONOSYNTH) — 1 voice × 3 osc; unassigned PW pins skip, so PW cal runs once on channel 0.
+- [DCO4-REBORN](https://github.com/felipegaspari/DCO4-REBORN) — 4 voices × 2 osc; PW indexed with `cal_pw_channel(osc)` (`NUM_PW_CHANNELS = 4`, channel = osc / 2).
+
+Algorithms and the operator workflow live in this repo: [`docs/AUTOTUNE.md`](docs/AUTOTUNE.md), [`docs/CALIBRATION_PROCEDURE.md`](docs/CALIBRATION_PROCEDURE.md).
 
 ---
 
