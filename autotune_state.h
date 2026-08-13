@@ -1,6 +1,7 @@
 #ifndef __AUTOTUNE_STATE_H__
 #define __AUTOTUNE_STATE_H__
 
+#include <Arduino.h>
 #include "autotune_config.h"
 
 // Unified runtime state for autotune. Avoids scattered globals.
