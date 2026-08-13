@@ -14,17 +14,18 @@ struct DCOCalibrationContext {
   uint8_t& currentNote;
   // Pointer to the per-DCO calibration buffer (calibrationData).
   uint32_t* calibrationData;
-  // Pointer to the per-osc manual calibration offsets.
+  // Pointer to the per-osc manual calibration offsets (±20 counts).
   int8_t* manualOffsetByOsc;
-  // Pointer to the per-osc initial manual amp-comp values.
-  int8_t* initManualAmpByOsc;
+  // Pointer to the per-osc initial manual amp-comp values. These are RANGE PWM
+  // counts scaled from DIV_COUNTER, so they do not fit in a byte.
+  uint16_t* initManualAmpByOsc;
 
   DCOCalibrationContext(
     uint8_t& dcoIndexRef,
     uint8_t& currentNoteRef,
     uint32_t* calibrationDataPtr,
     int8_t* manualOffsetPtr,
-    int8_t* initManualAmpPtr
+    uint16_t* initManualAmpPtr
   )
     : dcoIndex(dcoIndexRef),
       currentNote(currentNoteRef),

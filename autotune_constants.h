@@ -142,6 +142,11 @@ constexpr float kSearchStepCentsLow      = 100.0f;  // kSearchStepVeryLowHz .. L
 constexpr float kSearchStepCentsMid      = 200.0f;  // kSearchStepLowHz .. HighHz
 constexpr float kSearchStepCentsHigh     = 400.0f;  // above kSearchStepHighHz
 
+// Smallest frequency move the search will make, and the "same frequency" test.
+// A 2-cent stop at 8 Hz is ~0.01 Hz — finer than the measurement — and was
+// treating opposite-sign readings at one frequency as a finished bracket.
+constexpr float kMinFreqStepHz = 0.1f;
+
 // ... and, tighter than any of those, what the latest reading itself implies.
 // The duty error moves ~3-4% per 100 cents across the whole range, so a seed
 // that reads -0.07% is a few cents from the answer and a 100-cent jump away

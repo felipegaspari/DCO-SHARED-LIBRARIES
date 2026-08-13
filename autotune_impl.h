@@ -25,11 +25,42 @@ static inline void apply_pw_center(uint8_t ch) {
   PW[ch] = PW_CENTER[ch];
 }
 
-// For debug logging and duty computation in gap measurement: track the last
-// PW raw value we explicitly programmed for the current DCO, the duty
+// Stored center on the measured channel, 0 on all the others — the same rule
+// the manual walk follows (voice_task_autotune), and for the same reason: the
+// pulse is the one wave with no analog switch, so a channel left anywhere but 0
+// is an open pulse on a voice nothing is measuring. Applies only; no search can
+// move a stored center from here.
+//
+// Only the soloed channel is tracked in PW[]: the muted ones would write PW[0],
+// which the play path reads as the panel's pulse width (apply_param_pw_value).
+static void apply_pw_center_solo(uint8_t soloCh) {
+  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    if (PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
+    if (ch == soloCh) {
+      apply_pw_center(ch);
+      continue;
+    }
+    pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
+  }
+}
+
+// What a PW channel is actually driving, read back from the slice's compare
+// register. The diagnostics want this rather than a tracked copy: PW[] is not a
+// hardware mirror (the play path's voice_write_pw() does not update it, and
+// PW[0] doubles as the panel's pulse width), and the tracker this replaces was
+// only touched by the PW search — it reported 0 through whole amp runs that were
+// in fact sitting at max wrap.
+static uint16_t pw_level_readback(uint8_t ch) {
+  if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return 0;
+  const uint32_t cc = pwm_hw->slice[PW_PWM_SLICES[ch]].cc;
+  return (pwm_gpio_to_channel(PW_PINS[ch]) == PWM_CHAN_A) ? (uint16_t)(cc & 0xFFFFu)
+                                                          : (uint16_t)(cc >> 16);
+}
+
+// For debug logging and duty computation in gap measurement: the duty
 // target/period assumed by the current PW search routine, and the most
-// recently measured period from find_gap().
-static uint16_t g_lastPWMeasurementRaw = 0;
+// recently measured period from find_gap(). The PW in force is not tracked
+// here — pw_level_readback() asks the hardware instead.
 static double   g_gapLogCurrentPeriodUs = 0.0;
 static double   g_gapLogTargetDutyFraction = 0.5;  // default 50%
 
@@ -62,8 +93,14 @@ static void disable_all_oscillators_and_range_pwm() {
     gpio_put(RANGE_PINS[i], 1);
   }
 
-  // After all RANGE caps are charged, park shared PW PWM at max wrap so the
+  // After all RANGE caps are charged, park every PW PWM at max wrap so the
   // centre search can start from a known state. (Matches original behaviour.)
+  //
+  // Max wrap is a rail, not a usable operating point: there the comparator has
+  // no crossing to make and the sense pin never toggles. Only the PW searches
+  // may leave it here, since they program PW on every probe. Any stage that
+  // measures without writing PW has to put the stored centre back first —
+  // restart_DCO_calibration() does that for the amp-comp stage.
   reset_pw_to_DIV_COUNTER_PW();
 
   // Nothing is oscillating any more, so the next probe is a cold start.
@@ -148,8 +185,9 @@ void DCO_calibration() {
 
   // PW is per channel (DCO3: one wired pin; DCO4: one per voice, two oscs
   // sharing it) and independent of the amp-comp stage. An amp-only run reuses
-  // the PW centers already stored in the FS. Each distinct assigned channel
-  // is calibrated once, driving the first oscillator that maps to it.
+  // the PW centers already stored in the FS, applied per oscillator by
+  // restart_DCO_calibration(). Each distinct assigned channel is calibrated
+  // once, driving the first oscillator that maps to it.
   if (runPW) {
     uint8_t lastCh = 0xFF;
     for (uint8_t osc = 0; osc < NUM_OSCILLATORS && !calibrationCancelRequested; ++osc) {
@@ -165,9 +203,6 @@ void DCO_calibration() {
       if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_LOW);
       if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_HIGH);
     }
-  }
-  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
-    apply_pw_center(ch);
   }
 
   for (int i = 0; runAmp && i < NUM_OSCILLATORS && !calibrationCancelRequested; i++) {
@@ -370,7 +405,7 @@ void print_calibration_report(uint8_t dcoIndex, const uint32_t *data) {
     }
 
     String line = "[CAL_REPORT] " + cal_pad_left(String(p), 4);
-    line += cal_pad_left(isSent ? String("-") : String(freqHz, 2), 10);
+    line += cal_pad_left(isSent ? String("-") : fmt_freq(freqHz), 10);
     line += cal_pad_left(String(amp), 9);
 
     if (hasErr) {
@@ -469,7 +504,6 @@ void run_calibration_verify_sweep() {
   for (uint8_t osc = 0; osc < NUM_OSCILLATORS && !calibrationCancelRequested; ++osc) {
     currentDCO = osc;
     restart_DCO_calibration();
-    apply_pw_center(cal_pw_channel(osc));
 
     // Top of the useful range: the frequency where the table saturates at full
     // amp comp. Without a plateau, fall back to the amp-comp table's own limit.
@@ -496,7 +530,7 @@ void run_calibration_verify_sweep() {
       const float gapUs = measure_duty_at_freq(freqHz, amp, true);
 
       String line = (String)"[CAL_VERIFY] DCO=" + osc + " note=" + note +
-                    " freq=" + String(freqHz, 2) + " amp=" + amp;
+                    " freq=" + fmt_freq(freqHz) + " amp=" + amp;
       if (gapUs == kGapTimeoutSentinel) {
         Serial.println(line + " dutyErr=- gapUs=- (no signal)");
         continue;
@@ -576,6 +610,13 @@ void restart_DCO_calibration() {
   uint8_t sm1N = VOICE_TO_SM[currentDCO];
   pio_sm_set_enabled(pioN, sm1N, true);
 
+  // Undo the PW park above for this oscillator: the amp-comp stage never writes
+  // PW itself (voice_task_autotune's auto branch only touches the divider and
+  // RANGE), so whatever is left here is what it measures at — and the rail the
+  // park leaves gives the comparator no crossing at all, hence a whole run of
+  // [GAP_TIMEOUT] with edges=0. The PW searches overwrite this immediately.
+  apply_pw_center_solo(cal_pw_channel(currentDCO));
+
   // This oscillator starts from nothing, so its first probe gets the full
   // settle budget instead of one sized against the previous one's frequency.
   g_lastDrivenFreqHz = 0.0f;
@@ -589,16 +630,20 @@ void restart_DCO_calibration() {
 // PW search — shared low-level helpers
 /*************************************************************************************/
 
-// Helper: program a PW value on the given voice, keep PW[] and the debug
+// Helper: program a PW value on the given PW channel, keep PW[] and the debug
 // tracker in sync, wait for the waveform to settle and measure the gap.
 // This replaces the "set PWM, delay, measure" blocks that used to be
 // copy-pasted throughout the PW search code.
-static GapMeasurement set_pw_and_measure(uint8_t voiceIdx, uint16_t pw) {
-  pwm_set_chan_level(PW_PWM_SLICES[voiceIdx],
-                     pwm_gpio_to_channel(PW_PINS[voiceIdx]),
+//
+// pwCh is a PW channel, `cal_pw_channel(osc)` — not an oscillator index. They
+// coincide on DCO3 (one channel, index 0) and do not on DCO4 (two oscillators
+// per channel), which is why the centre search's callers pass it explicitly
+// instead of assuming 0: they used to sweep voice 0 whatever was calibrated.
+static GapMeasurement set_pw_and_measure(uint8_t pwCh, uint16_t pw) {
+  pwm_set_chan_level(PW_PWM_SLICES[pwCh],
+                     pwm_gpio_to_channel(PW_PINS[pwCh]),
                      pw);
-  PW[voiceIdx]           = pw;
-  g_lastPWMeasurementRaw = pw;
+  PW[pwCh] = pw;
   delay(30);
   return measure_gap(2);
 }
@@ -676,7 +721,7 @@ static void pw_coarse_scan(PWSearchState& st,
       break;
     }
 
-    GapMeasurement gm = set_pw_and_measure(0, pw);
+    GapMeasurement gm = set_pw_and_measure(cal_pw_channel(currentDCO), pw);
     if (gm.timedOut) {
       continue;  // no usable signal at this PW
     }
@@ -710,7 +755,7 @@ static void pw_coarse_scan(PWSearchState& st,
         double t = fabs(prevGapDiff) / denom;  // weight towards the closer side
         uint16_t pwEst = (uint16_t)((double)prevPW + ((double)(pw - prevPW) * t));
         if (pwEst >= pwMin && pwEst <= pwMax) {
-          GapMeasurement gmEst = set_pw_and_measure(0, pwEst);
+          GapMeasurement gmEst = set_pw_and_measure(cal_pw_channel(currentDCO), pwEst);
           if (!gmEst.timedOut) {
             pw_record_sample(st, pwEst, (double)gmEst.value - gapTarget,
                              targetGap, PW_RECORD_APPEND);
@@ -744,7 +789,7 @@ static void pw_bisect_bracket(PWSearchState& st,
     }
 
     uint16_t pwMid = (uint16_t)((pwLow + pwHigh) / 2);
-    GapMeasurement gm = set_pw_and_measure(0, pwMid);
+    GapMeasurement gm = set_pw_and_measure(cal_pw_channel(currentDCO), pwMid);
     if (gm.timedOut) {
       // No valid data at this midpoint; try again on the next iteration.
       if (autotuneDebug >= 2) {
@@ -814,7 +859,7 @@ static void pw_fine_scan_around_best(PWSearchState& st,
       break;
     }
 
-    GapMeasurement gm = set_pw_and_measure(0, pw);
+    GapMeasurement gm = set_pw_and_measure(cal_pw_channel(currentDCO), pw);
     if (gm.timedOut) {
       continue;
     }
@@ -902,7 +947,8 @@ static bool pw_select_and_lock(PWSearchState& st,
     double   chosenGap = gapTarget + st.validGapDiff[bestIdx];
 
     double lockedGap = 0.0;
-    if (pw_lock_in(0, chosenPW, gapTarget, targetGap, periodUs, lockedGap)) {
+    if (pw_lock_in(cal_pw_channel(currentDCO), chosenPW, gapTarget, targetGap,
+                   periodUs, lockedGap)) {
       chosenGap = lockedGap;
 
       // Local refinement: probe a small neighbourhood around the locked-in PW
@@ -917,7 +963,8 @@ static bool pw_select_and_lock(PWSearchState& st,
         uint16_t testPW = (uint16_t)testPW32;
 
         double gapLocal = 0.0;
-        if (pw_lock_in(0, testPW, gapTarget, targetGap, periodUs, gapLocal)) {
+        if (pw_lock_in(cal_pw_channel(currentDCO), testPW, gapTarget, targetGap,
+                       periodUs, gapLocal)) {
           double absGapDiffLocal = fabs(gapLocal - gapTarget);
           if (absGapDiffLocal < bestLocalGapAbs) {
             bestLocalGapAbs = absGapDiffLocal;
@@ -1077,7 +1124,6 @@ void find_PW_center(uint8_t mode) {
 
   // Apply the starting PW to the PW PWM channel before configuring the DCO.
   pwm_set_chan_level(PW_PWM_SLICES[pwCh], pwm_gpio_to_channel(PW_PINS[pwCh]), startPW);
-  g_lastPWMeasurementRaw = startPW;
 
   voice_task_autotune(voiceTaskMode, ampCompCalibrationVal);
 
@@ -1101,8 +1147,7 @@ void find_PW_center(uint8_t mode) {
   pwm_set_chan_level(PW_PWM_SLICES[pwCh],
                      pwm_gpio_to_channel(PW_PINS[pwCh]),
                      centerPW);
-  PW[pwCh]               = centerPW;
-  g_lastPWMeasurementRaw = centerPW;
+  PW[pwCh] = centerPW;
 }
 
 
@@ -1588,7 +1633,7 @@ float find_gap(byte specialMode) {
       // Manual cal: log at debug >= 1. Auto-cal keeps the quieter >= 3 threshold.
       if (autotuneDebug >= 3 || (manualCalibrationFlag && autotuneDebug >= 1)) {
         Serial.println((String)"[GAP_TIMEOUT] note=" + DCO_calibration_current_note +
-                       (String)" freq=" + (float)freqHz +
+                       (String)" freq=" + fmt_freq((float)freqHz) +
                        (String)" DCO=" + currentDCO +
                        (String)" raw=" + (int)rawAtTimeout +
                        (String)" edges=" + edgesSeen +
@@ -1596,7 +1641,7 @@ float find_gap(byte specialMode) {
                        (String)" accepted=" + acceptedSamples +
                        (String)" TidealUs≈" + (uint32_t)idealPeriodUs +
                        (String)" timeoutUs=" + (uint32_t)timeoutUs +
-                       (String)" PW_raw=" + g_lastPWMeasurementRaw +
+                       (String)" PW_raw=" + pw_level_readback(cal_pw_channel(currentDCO)) +
                        (String)" ampComp=" + ampCompCalibrationVal);
       }
 
@@ -1680,7 +1725,7 @@ float find_gap(byte specialMode) {
   // search and the PW limit search read extreme duties on purpose.
   if (specialMode == 3 && (risingCount == 0 || fallingCount == 0)) {
     if (autotuneDebug >= 2) {
-      Serial.println((String)"[GAP_ONESIDED] freq=" + (float)freqHz +
+      Serial.println((String)"[GAP_ONESIDED] freq=" + fmt_freq((float)freqHz) +
                      (String)" DCO=" + currentDCO +
                      (String)" highs=" + risingCount +
                      (String)" lows=" + fallingCount +
@@ -1714,7 +1759,7 @@ float find_gap(byte specialMode) {
       fabsf(measuredPeriodUs - (float)idealPeriodUs) >
         kGapPeriodTolRatio * (float)idealPeriodUs) {
     if (autotuneDebug >= 2) {
-      Serial.println((String)"[GAP_OFFPERIOD] freq=" + (float)freqHz +
+      Serial.println((String)"[GAP_OFFPERIOD] freq=" + fmt_freq((float)freqHz) +
                      (String)" DCO=" + currentDCO +
                      (String)" Tmeas=" + measuredPeriodUs +
                      (String)" Tideal=" + (float)idealPeriodUs +
@@ -1750,10 +1795,10 @@ float find_gap(byte specialMode) {
 
     Serial.println((String)"[GAP_MEASURE] mode=" + specialMode +
                    (String)" note=" + DCO_calibration_current_note +
-                   (String)" freq=" + (float)freqHz +
+                   (String)" freq=" + fmt_freq((float)freqHz) +
                    (String)" DCO=" + currentDCO +
                    (String)" AMP=" + ampCompCalibrationVal +
-                   (String)" PW_raw=" + g_lastPWMeasurementRaw +
+                   (String)" PW_raw=" + pw_level_readback(cal_pw_channel(currentDCO)) +
                    (String)" diff=" + diffUs +
                    (String)" avgLowUs=" + avgLowUs +
                    (String)" avgHighUs=" + avgHighUs +
@@ -1770,6 +1815,141 @@ float find_gap(byte specialMode) {
 /*************************************************************************************/
 /*************************************************************************************/
 
+// --- PW CV probe ------------------------------------------------------------
+
+// PW raw levels walked by the probe: both rails plus three points across the
+// span, so a comparator that only reacts near its center still shows movement.
+static const uint16_t kPWProbeLevels[] = {
+  0, DIV_COUNTER_PW / 4, DIV_COUNTER_PW / 2,
+  (DIV_COUNTER_PW * 3) / 4, DIV_COUNTER_PW - 1
+};
+
+// Duty span (percentage points) above which a channel counts as having moved
+// the pulse. Measurement noise on a good board is a fraction of a point.
+static constexpr float kPWProbeMovedPct = 5.0f;
+
+// Prove whether a PW CV write reaches the pulse comparator at all, and whether
+// it reaches the voice the firmware believes it does (PARAM_DEBUG_COMMAND 46,
+// run from loop1 while manual calibration is active).
+//
+// Manual cal is required because only then is a single oscillator soloed onto
+// the cal-sense pin: the duty measured there is the only witness that the CV
+// arrived. Every PW channel is walked, not just the calibrated one, so a duty
+// that follows some other channel means PW_PINS does not match the wiring,
+// while a duty that follows nothing means there is no CV path to this
+// oscillator's pulse and no firmware change can mute it.
+//
+// Leaves PW clobbered on purpose: the next manual-cal pass in loop1 rewrites
+// every channel from the current substage.
+void run_pw_cv_probe() {
+  const uint8_t osc       = cal_manual_osc();
+  const uint8_t expectCh  = cal_pw_channel(osc);
+  const double  freqHz    = (double)note_to_freq(DCO_calibration_current_note);
+  const double  periodUs  = (freqHz > 0.0) ? (1000000.0 / freqHz) : 0.0;
+
+  Serial.println((String)"[PW_PROBE] start: osc=" + osc +
+                 " expected ch=" + expectCh +
+                 " (pin GP" + PW_PINS[expectCh] + ")" +
+                 " stage=" + manualCalibrationStage +
+                 " note=" + DCO_calibration_current_note +
+                 " freq=" + fmt_freq((float)freqHz));
+
+  if (periodUs <= 0.0) {
+    Serial.println("[PW_PROBE] no note driven; nothing to measure");
+    return;
+  }
+
+  uint8_t bestCh    = 0;
+  float   bestSpan  = -1.0f;
+  float   expectSpan = 0.0f;
+  bool    anyRead   = false;
+
+  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    if (PW_PINS[ch] == PW_PIN_UNASSIGNED) {
+      Serial.println((String)"[PW_PROBE] ch=" + ch + " not wired, skipped");
+      continue;
+    }
+
+    // Only the channel under test carries a CV, so a duty that moves anyway
+    // belongs to whatever channel is actually feeding this oscillator.
+    for (uint8_t z = 0; z < NUM_PW_CHANNELS; ++z) {
+      if (z != ch && PW_PINS[z] != PW_PIN_UNASSIGNED) {
+        pwm_set_chan_level(PW_PWM_SLICES[z], pwm_gpio_to_channel(PW_PINS[z]), 0);
+        PW[z] = 0;
+      }
+    }
+
+    float dutyMin = 0.0f, dutyMax = 0.0f;
+    uint8_t reads = 0;
+    const uint8_t levels = (uint8_t)(sizeof(kPWProbeLevels) / sizeof(kPWProbeLevels[0]));
+
+    for (uint8_t li = 0; li < levels && !calibrationCancelRequested; ++li) {
+      const uint16_t pw = kPWProbeLevels[li];
+      GapMeasurement gm = set_pw_and_measure(ch, pw);
+
+      String line = (String)"[PW_PROBE] ch=" + ch + " pin=GP" + PW_PINS[ch] +
+                    " PW_raw=" + pw;
+      if (gm.timedOut) {
+        Serial.println(line + " TIMEOUT");
+        continue;
+      }
+      const float dutyPct = (float)((0.5 + (double)gm.value / (2.0 * periodUs)) * 100.0);
+      Serial.println(line + " gapUs=" + gm.value +
+                     " duty≈" + String(dutyPct, 2) + "%");
+
+      if (reads == 0 || dutyPct < dutyMin) dutyMin = dutyPct;
+      if (reads == 0 || dutyPct > dutyMax) dutyMax = dutyPct;
+      ++reads;
+      anyRead = true;
+    }
+
+    const float span = (reads > 0) ? (dutyMax - dutyMin) : 0.0f;
+    Serial.println((String)"[PW_PROBE] ch=" + ch + " pin=GP" + PW_PINS[ch] +
+                   " reads=" + reads + "/" + levels +
+                   " span≈" + String(span, 2) + "pp" +
+                   (ch == expectCh ? "  <-- expected for this oscillator" : ""));
+
+    if (ch == expectCh) expectSpan = span;
+    if (span > bestSpan) {
+      bestSpan = span;
+      bestCh   = ch;
+    }
+    if (calibrationCancelRequested) break;
+  }
+
+  apply_pw_center(expectCh);
+
+  if (calibrationCancelRequested) {
+    Serial.println("[PW_PROBE] cancelled by user");
+    calibrationCancelRequested = false;
+    return;
+  }
+
+  if (!anyRead) {
+    Serial.println("[PW_PROBE] every read timed out: the cal-sense pin sees no pulse "
+                   "at all, so this says nothing about the PW CV");
+    cal_sense_probe_log();
+    return;
+  }
+  if (expectSpan >= kPWProbeMovedPct) {
+    Serial.println((String)"[PW_PROBE] done: expected ch=" + expectCh +
+                   " moves the duty by " + String(expectSpan, 2) +
+                   "pp, so the CV is live; look downstream in the mix");
+    return;
+  }
+  if (bestSpan >= kPWProbeMovedPct) {
+    Serial.println((String)"[PW_PROBE] done: the duty follows ch=" + bestCh +
+                   " (GP" + PW_PINS[bestCh] + ", span " + String(bestSpan, 2) +
+                   "pp) instead of the expected ch=" + expectCh +
+                   ": PW_PINS does not match the wiring");
+    return;
+  }
+  Serial.println((String)"[PW_PROBE] done: no channel moves the duty (widest " +
+                 String(bestSpan, 2) + "pp on ch=" + bestCh +
+                 "): the PW CV does not reach this oscillator's pulse, "
+                 "so it cannot be muted from firmware");
+}
+
 // Debug helper used during manual calibration: measure and report the
 // duty-cycle difference from the target duty (normally 50%) for the
 // current note/DCO. The result is sent to the Input board as a 32-bit
@@ -1780,9 +1960,9 @@ void DCO_calibration_debug() {
   // of "gap" as the automatic routines.
   GapMeasurement gm = measure_gap(0);  // target is 50% duty
 
-  // Osc under trim is selected by manualCalibrationStage (not currentDCO,
-  // which is only advanced during auto-cal).
-  uint8_t reportDCO = manualCalibrationStage;
+  // Osc under trim comes from the stage walk (not currentDCO, which only moves
+  // during auto-cal). The stage counts substages, so it is not the osc index.
+  uint8_t reportDCO = cal_manual_osc();
   if (reportDCO >= NUM_OSCILLATORS) {
     reportDCO = NUM_OSCILLATORS - 1;
   }
@@ -1834,8 +2014,9 @@ void DCO_calibration_debug() {
   }
 
   // Send as a 32-bit PARAM_GAP_FROM_DCO value through the standard
-  // param protocol: Serial2 → Input, which relays it to the Screen.
-  serialSendParam32(PARAM_GAP_FROM_DCO, dutyErrorPercentTimes100);
+  // param protocol: Serial2 → Mainboard, which relays it to the Screen.
+  // force: do not drop when Serial2 DMA is busy — this is the live GAP UI.
+  serialSendParam32(PARAM_GAP_FROM_DCO, (uint32_t)dutyErrorPercentTimes100, true);
 }
 
 #endif  // __AUTOTUNE_IMPL_H__
