@@ -36,6 +36,15 @@ static int g_lastFreqBisectProbes = 0;
 // rather than silently biasing the readings.
 static int g_lastSettleChecks = 0;
 
+// Last measure_duty_at_freq() at amp 0 never got two readings to agree.
+// find_freq_for_duty50() then treats the probe as sign-only (no INTERP).
+static bool g_lastDutyUnsettled = false;
+
+// Secant seed from the last amp0_prescan() that found a sign change, or 0.
+// FREQ_TRACE stores this when the endpoint search is rejected, instead of
+// the model intercept that can sit below the pulse floor.
+static float g_lastAmp0ScanSeedHz = 0.0f;
+
 // Compute allowed |gap| (in microseconds) for a given frequency (Hz) and
 // duty-cycle error fraction (e.g. 0.005 = 0.5% duty error).
 // From duty_high - 0.5 = gap / (2*T): |gap|max = 2 * epsilon * T.
@@ -270,6 +279,9 @@ float measure_duty_at_freq(float freqHz, uint16_t amp, bool hiRes) {
   if (movedCents >= kSettleSkipCents) {
     checks = bigMove ? (int)prec.settleMaxChecks : 1;
   }
+  if (amp == 0 && checks < 3) {
+    checks = 3;
+  }
 
   // "Settled" = two readings that agree closely enough that more waiting could
   // not change what the search decides.
@@ -281,6 +293,7 @@ float measure_duty_at_freq(float freqHz, uint16_t amp, bool hiRes) {
 
   float value    = gm.value;
   bool  settled  = (checks == 0);
+  g_lastDutyUnsettled = false;
   for (int c = 0; c < checks; ++c) {
     if (calibrationCancelRequested) {
       break;
@@ -298,7 +311,7 @@ float measure_duty_at_freq(float freqHz, uint16_t amp, bool hiRes) {
       // pulse" wall that stopped the pair-1 search 1% short of the answer.
       // The check is consumed; if none are left, the valid reading stands.
       if (autotuneDebug >= 2) {
-        Serial.println((String)"[FREQ_SETTLE] f=" + freqHz + " amp=" + amp +
+        Serial.println((String)"[FREQ_SETTLE] f=" + fmt_freq(freqHz) + " amp=" + amp +
                        " re-read discarded; keeping the valid reading");
       }
       continue;
@@ -308,13 +321,24 @@ float measure_duty_at_freq(float freqHz, uint16_t amp, bool hiRes) {
       settled = true;
       break;
     }
-    value = again.value;  // still moving: the newer reading is the better one
+    if (amp == 0) {
+      // Keep the reading closer to 50% (smaller |gap|). The newer one used
+      // to throw away a 49.90% settle in favour of a later 3% swing.
+      if (fabsf(again.value) < fabsf(value)) {
+        value = again.value;
+      }
+    } else {
+      value = again.value;  // still moving: the newer reading is the better one
+    }
   }
 
   if (!settled && autotuneDebug >= 2) {
-    Serial.println((String)"[FREQ_SETTLE] f=" + freqHz + " amp=" + amp +
+    Serial.println((String)"[FREQ_SETTLE] f=" + fmt_freq(freqHz) + " amp=" + amp +
                    " moved=" + movedCents + " cents; no two readings within " +
                    stableTol + " us after " + checks + " checks");
+  }
+  if (!settled && amp == 0) {
+    g_lastDutyUnsettled = true;
   }
 
   gapGateFreqHz = 0.0f;
@@ -332,6 +356,15 @@ static constexpr double kBracketEdgeGuard = 0.05;
 // could change. Without a floor the search re-probes the same frequency until
 // the budget runs out (seen at the amp-0 endpoint: ~20 probes at 6.29 Hz).
 static constexpr double kBracketMinWidthCents = 3.0;
+
+// Snap a candidate so the probe actually moves by at least kMinFreqStepHz.
+static double snap_min_freq_step(double from, double to) {
+  if (fabs(to - from) >= (double)kMinFreqStepHz) {
+    return to;
+  }
+  return (to >= from) ? (from + (double)kMinFreqStepHz)
+                      : (from - (double)kMinFreqStepHz);
+}
 
 // Largest step one probe of the frequency search may take at this frequency:
 // 400 cents above 440 Hz, 200 from 100 Hz up, 100 below that (including the
@@ -486,6 +519,7 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
 
     const float diff      = measure_duty_at_freq((float)f, amp, refine);
     const bool  timedOut  = (diff == kGapTimeoutSentinel);
+    const bool  signOnly  = timedOut || (amp == 0 && g_lastDutyUnsettled);
 
     if (!timedOut) {
       if (f > highGoodFreq) {
@@ -502,7 +536,7 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
 
       if (autotuneDebug >= 2) {
         Serial.println((String)"[FREQ_BISECT] amp=" + amp +
-                       (String)" f=" + f + (String)" gap=" + diff +
+                       (String)" f=" + fmt_freq((float)f) + (String)" gap=" + diff +
                        (String)" dutyErr=" +
                        duty_err_pct_from_gap(diff, (float)f) + "%");
       }
@@ -538,11 +572,11 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
     if (side > 0) {
       fHi           = f;
       gHi           = timedOut ? 0.0 : (double)diff;
-      hiFromTimeout = timedOut;
+      hiFromTimeout = signOnly;
     } else {
       fLo           = f;
       gLo           = timedOut ? 0.0 : (double)diff;
-      loFromTimeout = timedOut;
+      loFromTimeout = signOnly;
     }
     // Illinois: when the same edge is replaced twice running, halve the stale
     // edge's error so the interpolation stops creeping in from one side.
@@ -562,27 +596,42 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
     if (!bounded && timeouts >= kMaxSearchTimeouts) {
       Serial.println((String)"[FREQ_BISECT] amp=" + amp +
                      (String)" gave up after " + timeouts +
-                     " probes in a row with no pulse (last " + f +
-                     " Hz, seed " + freqGuess + "); keeping best=" + bestFreq);
+                     " probes in a row with no pulse (last " + fmt_freq((float)f) +
+                     " Hz, seed " + fmt_freq(freqGuess) + "); keeping best=" +
+                     fmt_freq(bestFreq));
       break;
     }
 
     if (fLo > 0.0 && fHi > 0.0) {
-      // A bracket this narrow is exhausted: the answer is pinned to within the
-      // measurement noise, and further probes only re-measure the same point.
+      // A bracket narrower than the smallest probe move is exhausted. A
+      // 3-cent floor used to stop with a 3% duty error still on the table;
+      // only stop on cents when the best reading is already inside tolerance.
+      const double widthHz    = fHi - fLo;
       const double widthCents = 1200.0 * log2(fHi / fLo);
-      if (widthCents < kBracketMinWidthCents) {
+      if (widthHz < (double)kMinFreqStepHz ||
+          (widthCents < kBracketMinWidthCents && bestAbsGap <= tol)) {
         if (autotuneDebug >= 1) {
           Serial.println((String)"[FREQ_BISECT] amp=" + amp +
-                         (String)" bracket exhausted at " + (float)fLo + ".." +
-                         (float)fHi + " Hz (" + (float)widthCents +
-                         " cents); keeping best=" + bestFreq);
+                         (String)" bracket exhausted at " + fmt_freq((float)fLo) + ".." +
+                         fmt_freq((float)fHi) + " Hz (" + (float)widthCents +
+                         " cents); keeping best=" + fmt_freq(bestFreq));
         }
         break;
       }
+      const double prevF = f;
       f = next_probe_in_bracket(fLo, fHi, gLo, gHi,
                                 hiFromTimeout || loFromTimeout,
                                 tol * (double)prec.settleStableMult);
+      f = snap_min_freq_step(prevF, f);
+      if (f <= fLo) f = fLo + (double)kMinFreqStepHz;
+      if (f >= fHi) f = fHi - (double)kMinFreqStepHz;
+      if (f <= fLo || f >= fHi) {
+        if (bestAbsGap <= tol) {
+          break;
+        }
+        // Nowhere left to put a distinct probe; keep the best reading.
+        break;
+      }
       // An edge that timed out puts that end of the bracket inside a dead zone,
       // and the answer is at its border, not in its middle. Keep the next probe
       // within half a step of the nearest frequency that did produce a signal,
@@ -610,7 +659,8 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
       if (autotuneDebug >= 1) {
         Serial.println((String)"[FREQ_BISECT] amp=" + amp +
                        (String)" no bracket within " + travelBudget +
-                       " cents of " + freqGuess + " Hz; keeping best=" + bestFreq);
+                       " cents of " + fmt_freq(freqGuess) + " Hz; keeping best=" +
+                       fmt_freq(bestFreq));
       }
       break;
     }
@@ -626,6 +676,7 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
     }
     const double prev = f;
     f = f * pow(2.0, (side > 0 ? -1.0 : 1.0) * (double)stepCents / 1200.0);
+    f = snap_min_freq_step(prev, f);
     if (bounded) {
       if (f < boundLo) f = boundLo;
       if (f > boundHi) f = boundHi;
@@ -639,13 +690,14 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
           Serial.println((String)"[FREQ_BISECT] amp=" + amp +
                          (String)" readings keep pointing " +
                          ((prev <= boundLo) ? "below" : "above") +
-                         " the band " + (float)boundLo + ".." + (float)boundHi +
-                         " Hz; keeping best=" + bestFreq);
+                         " the band " + fmt_freq((float)boundLo) + ".." +
+                         fmt_freq((float)boundHi) +
+                         " Hz; keeping best=" + fmt_freq(bestFreq));
         } else {
           Serial.println((String)"[FREQ_BISECT] amp=" + amp +
-                         (String)" no pulse anywhere in " + (float)boundLo + ".." +
-                         (float)boundHi + " Hz (" + timeouts +
-                         " timeouts); keeping best=" + bestFreq);
+                         (String)" no pulse anywhere in " + fmt_freq((float)boundLo) + ".." +
+                         fmt_freq((float)boundHi) + " Hz (" + timeouts +
+                         " timeouts); keeping best=" + fmt_freq(bestFreq));
         }
         break;
       }
@@ -675,7 +727,7 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
 
   if (bestAbsGap >= 1e9f) {
     Serial.println((String)"[FREQ_BISECT] amp=" + amp +
-                   (String)" no valid signal around " + freqGuess + " Hz");
+                   (String)" no valid signal around " + fmt_freq(freqGuess) + " Hz");
     return 0.0f;
   }
 
@@ -731,15 +783,19 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
       bestConfirmedFreq = (float)f;
     }
 
-    double roundTol = compute_gap_tolerance_for_freq(f, prec.bisectDutyTol);
+    const double acceptFrac = (amp == 0)
+      ? ((double)kEndpointAcceptDutyPct / 100.0)
+      : prec.bisectDutyTol;
+    double roundTol = compute_gap_tolerance_for_freq(f, acceptFrac);
     if (roundTol < prec.bisectGapFloorUs) roundTol = prec.bisectGapFloorUs;
-    if (fabsf(avg) <= roundTol || round + 1 >= confirmRounds) {
+    if (fabsf(avg) <= roundTol) {
       break;
     }
 
     // Correct through the bracket the search already built. Without one (the
     // seed was accepted on the first probe) there is nothing to interpolate
-    // against, so the averaged reading stands.
+    // against, so the averaged reading stands — do not accept just because
+    // confirmRounds is exhausted.
     if (avg > 0.0f) {
       fHi = f; gHi = (double)avg; hiFromTimeout = false;
     } else {
@@ -755,10 +811,11 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
     }
     if (autotuneDebug >= 2) {
       Serial.println((String)"[FREQ_BISECT] amp=" + amp +
-                     (String)" confirm " + f + " avg=" + avg +
-                     (String)" over " + n + " reads; correcting to " + next);
+                     (String)" confirm " + fmt_freq((float)f) + " avg=" + avg +
+                     (String)" over " + n + " reads; correcting to " +
+                     fmt_freq((float)next));
     }
-    f = next;
+    f = snap_min_freq_step(f, next);
   }
 
   if (bestConfirmedGap >= 1e9f) {
@@ -766,9 +823,27 @@ float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio,
     return bestFreq;  // every confirmation reading timed out; keep the search result
   }
 
+  const float searchDuty  = fabsf(duty_err_pct_from_gap(bestAbsGap, bestFreq));
+  const float confirmDuty = fabsf(duty_err_pct_from_gap(bestConfirmedGap, bestConfirmedFreq));
+  const float acceptPct   = (amp == 0)
+    ? kEndpointAcceptDutyPct
+    : (float)(prec.bisectDutyTol * 100.0);
+  if (searchDuty <= acceptPct && confirmDuty > acceptPct) {
+    if (autotuneDebug >= 2) {
+      Serial.println((String)"[FREQ_BISECT] amp=" + amp +
+                     (String)" confirm " + fmt_freq(bestConfirmedFreq) +
+                     " dutyErr=" + confirmDuty +
+                     "% worse than search " + fmt_freq(bestFreq) +
+                     " dutyErr=" + searchDuty + "%; keeping search");
+    }
+    g_lastFreqBisectGapUs = bestSignedGap;
+    return bestFreq;
+  }
+
   if (autotuneDebug >= 2) {
     Serial.println((String)"[FREQ_BISECT] amp=" + amp +
-                   (String)" confirmed " + bestFreq + " -> " + bestConfirmedFreq +
+                   (String)" confirmed " + fmt_freq(bestFreq) + " -> " +
+                   fmt_freq(bestConfirmedFreq) +
                    (String)" gap=" + bestConfirmedGap + " (was " + bestAbsGap + ")" +
                    (String)" dutyErr=" +
                    duty_err_pct_from_gap(bestConfirmedGap, bestConfirmedFreq) + "%");
@@ -1044,6 +1119,7 @@ static float scan_duty_at_freq(float freqHz, uint16_t amp) {
 static FreqSearchBounds amp0_prescan(FreqSearchBounds band, float fallbackHz,
                                      float *seedOut) {
   *seedOut = fallbackHz;
+  g_lastAmp0ScanSeedHz = 0.0f;
   if (!(band.loHz > 0.0f && band.hiHz > band.loHz) || kAmp0ScanPoints < 2) {
     return band;
   }
@@ -1067,10 +1143,10 @@ static FreqSearchBounds amp0_prescan(FreqSearchBounds band, float fallbackHz,
     if (gap == kGapTimeoutSentinel) {
       // The sentinel covers a real timeout but also a reading the gap gates
       // discarded (one-sided, off-period) - the pin may well have pulsed.
-      Serial.println((String)"[AMP0_SCAN] f=" + (float)f + " no usable reading");
+      Serial.println((String)"[AMP0_SCAN] f=" + fmt_freq((float)f) + " no usable reading");
       continue;
     }
-    Serial.println((String)"[AMP0_SCAN] f=" + (float)f + " dutyErr=" +
+    Serial.println((String)"[AMP0_SCAN] f=" + fmt_freq((float)f) + " dutyErr=" +
                    String(duty_err_pct_from_gap(gap, (float)f), 2) + "%");
     if (!found || fabsf(gap) < fabsf(bestGap)) {
       bestFreq = (float)f;
@@ -1098,20 +1174,22 @@ static FreqSearchBounds amp0_prescan(FreqSearchBounds band, float fallbackHz,
     const double t = (double)(-belowGap) / (double)(aboveGap - belowGap);
     *seedOut = (float)((double)belowFreq *
                        pow((double)aboveFreq / (double)belowFreq, t));
-    Serial.println((String)"[AMP0_SCAN] bracketed " + belowFreq + ".." +
-                   aboveFreq + " Hz; seeding the search at " + *seedOut + " Hz");
+    g_lastAmp0ScanSeedHz = *seedOut;
+    Serial.println((String)"[AMP0_SCAN] bracketed " + fmt_freq(belowFreq) + ".." +
+                   fmt_freq(aboveFreq) + " Hz; seeding the search at " +
+                   fmt_freq(*seedOut) + " Hz");
     return { belowFreq, aboveFreq };
   }
 
   if (!found) {
     Serial.println((String)"[AMP0_SCAN] no usable reading anywhere in " +
-                   band.loHz + ".." + band.hiHz +
-                   " Hz; seeding the search at " + fallbackHz);
+                   fmt_freq(band.loHz) + ".." + fmt_freq(band.hiHz) +
+                   " Hz; seeding the search at " + fmt_freq(fallbackHz));
     return band;
   }
   *seedOut = bestFreq;
-  Serial.println((String)"[AMP0_SCAN] no sign change in " + band.loHz + ".." +
-                 band.hiHz + " Hz; seeding the search at " + bestFreq +
+  Serial.println((String)"[AMP0_SCAN] no sign change in " + fmt_freq(band.loHz) + ".." +
+                 fmt_freq(band.hiHz) + " Hz; seeding the search at " + fmt_freq(bestFreq) +
                  " Hz (dutyErr=" +
                  String(duty_err_pct_from_gap(bestGap, bestFreq), 2) + "%)");
   return band;
@@ -1177,8 +1255,10 @@ void apply_measured_lowest_freq(DCOCalibrationContext& ctx) {
   const float foundHz = measure_lowest_freq_at_amp0(seedHz, &bounds);
   if (foundHz <= 0.0f) {
     Serial.println((String)"[LOWEST_FREQ] DCO=" + ctx.dcoIndex +
-                   " no pulse at amp 0 anywhere in " + floorHz + ".." + ceilHz +
-                   " Hz (seed=" + seedHz + "); keeping estimate " + prevHz);
+                   " no pulse at amp 0 anywhere in " + fmt_freq(floorHz) + ".." +
+                   fmt_freq(ceilHz) +
+                   " Hz (seed=" + fmt_freq(seedHz) + "); keeping estimate " +
+                   fmt_freq(prevHz));
     return;
   }
 
@@ -1187,10 +1267,11 @@ void apply_measured_lowest_freq(DCOCalibrationContext& ctx) {
   if (!(foundHz >= floorHz && foundHz <= ceilHz) || foundTimes100 == 0 ||
       fabsf(foundErr) > kEndpointAcceptDutyPct) {
     Serial.println((String)"[LOWEST_FREQ] DCO=" + ctx.dcoIndex +
-                   " rejected: best " + foundHz + " Hz dutyErr=" +
-                   String(foundErr, 2) + "% (band " + floorHz + ".." + ceilHz +
+                   " rejected: best " + fmt_freq(foundHz) + " Hz dutyErr=" +
+                   String(foundErr, 2) + "% (band " + fmt_freq(floorHz) + ".." +
+                   fmt_freq(ceilHz) +
                    ", accept " + kEndpointAcceptDutyPct +
-                   "%); keeping estimate " + prevHz);
+                   "%); keeping estimate " + fmt_freq(prevHz));
     return;
   }
 
@@ -1199,11 +1280,11 @@ void apply_measured_lowest_freq(DCOCalibrationContext& ctx) {
   cal_report_set_pair_from_gap(0, g_lastFreqBisectGapUs, foundHz,
                                CAL_SRC_ENDPOINT_AMP0);
   Serial.println((String)"[LOWEST_FREQ] DCO=" + ctx.dcoIndex +
-                 " amp=0 freq=" + foundHz +
+                 " amp=0 freq=" + fmt_freq(foundHz) +
                  " gapUs=" + g_lastFreqBisectGapUs +
                  " probes=" + g_lastFreqBisectProbes +
                  " settle=" + g_lastSettleChecks +
-                 " (seed=" + seedHz + ", was " + prevHz + ")");
+                 " (seed=" + fmt_freq(seedHz) + ", was " + fmt_freq(prevHz) + ")");
 }
 
 // Build the [frequency -> amplitude PWM] calibration table for the DCO in ctx.
@@ -1681,16 +1762,17 @@ static float amp0_fit_freq(const float *amps, const float *freqs, int count) {
   }
 
   Serial.println((String)"[AMP0_FIT] DCO=" + currentDCO +
-                 (String)" f0=" + (float)intercept +
+                 (String)" f0=" + fmt_freq((float)intercept) +
                  (String)" Hz slope=" + (float)(1.0 / slope) +
                  (String)" cnt/Hz points=" + n);
   return (float)intercept;
 }
 
 // Anchor refinement: the stored ampComp440 is a seed, not the truth. Correct
-// it until the bisected frequency is within kAnchorToleranceCents of 440 Hz.
-// How many corrections are allowed comes from the precision profile.
-static constexpr float kAnchorToleranceCents = 15.0f;
+// it until the 50% duty frequency is within kAnchorToleranceHz of 440 Hz.
+// Always try at least one amp correction after acquire when it is off by more
+// than that. How many corrections are allowed comes from the precision profile.
+static constexpr float kAnchorToleranceHz = 0.1f;
 
 // Bounds (in semitones) for the ladder spacing derived at runtime.
 static constexpr int kLadderIntervalMin = 3;
@@ -1869,8 +1951,14 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     return false;
   }
   if (anchorFreq <= 0.0f) {
+    // PW is on the line because this probe cannot see a pulse without it: at the
+    // rail the comparator has no crossing at any amp or frequency, so a PW far
+    // from the stored centre points at the run's setup, not at the anchor.
+    const uint8_t anchorPwCh = cal_pw_channel(ctx.dcoIndex);
     Serial.println((String)"[FREQ_TRACE_GUARD] DCO=" + ctx.dcoIndex +
                    " no signal at manual anchor amp=" + anchorAmp +
+                   " PW_raw=" + pw_level_readback(anchorPwCh) +
+                   " (centre " + PW_CENTER[anchorPwCh] + ")" +
                    "; aborting (previous table kept)");
     return false;
   }
@@ -1878,7 +1966,7 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   // Kept for the report: every later probe overwrites g_lastFreqBisectGapUs.
   float anchorGapUs = g_lastFreqBisectGapUs;
   Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
-                 " anchor amp=" + anchorAmp + " freq=" + anchorFreq +
+                 " anchor amp=" + anchorAmp + " freq=" + fmt_freq(anchorFreq) +
                  freq_trace_quality(anchorGapUs, anchorFreq,
                                     g_lastFreqBisectProbes, g_lastSettleChecks));
 
@@ -1906,7 +1994,7 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
       add_known(found, (float)manualAmp);
       const float cents = 1200.0f * log2f(found / nominalHz);
       Serial.println((String)"[FREQ_TRACE_MANUAL] DCO=" + ctx.dcoIndex +
-                     " amp=" + manualAmp + " freq=" + found +
+                     " amp=" + manualAmp + " freq=" + fmt_freq(found) +
                      " nominal=" + nominalHz + " dev=" + cents + " cents" +
                      freq_trace_quality(g_lastFreqBisectGapUs, found,
                                         g_lastFreqBisectProbes,
@@ -1929,10 +2017,12 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     const float target440 = note_to_freq(manual_cal_reference_note);
     const uint16_t storedAmp = anchorAmp;
     float cents = 1200.0f * log2f(anchorFreq / target440);
+    int tries = cal_precision().anchorTries;
+    if (tries < 1) tries = 1;
 
     for (int attempt = 0;
-         attempt < cal_precision().anchorTries &&
-         fabsf(cents) > kAnchorToleranceCents;
+         attempt < tries &&
+         fabsf(anchorFreq - target440) > kAnchorToleranceHz;
          ++attempt) {
       if (calibrationCancelRequested) {
         return false;
@@ -1969,10 +2059,12 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
       }
     }
 
+    cents = 1200.0f * log2f(anchorFreq / target440);
+
     Serial.println((String)"[FREQ_TRACE_ANCHOR] DCO=" + ctx.dcoIndex +
                    " stored=" + storedAmp + " refined=" + anchorAmp +
-                   " freq=" + anchorFreq + " dev=" + cents + " cents" +
-                   " (tol=" + kAnchorToleranceCents + " cents)" +
+                   " freq=" + fmt_freq(anchorFreq) + " dev=" + cents + " cents" +
+                   " (tol=" + kAnchorToleranceHz + " Hz)" +
                    " gapUs=" + anchorGapUs +
                    " dutyErr=" + duty_err_pct_from_gap(anchorGapUs, anchorFreq) + "%");
 
@@ -2018,7 +2110,7 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
       }
       add_known(fFound, (float)amp);
       Serial.println((String)"[FREQ_TRACE_BOOT] DCO=" + ctx.dcoIndex +
-                     " amp=" + amp + " freq=" + fFound +
+                     " amp=" + amp + " freq=" + fmt_freq(fFound) +
                      freq_trace_quality(g_lastFreqBisectGapUs, fFound,
                                         g_lastFreqBisectProbes,
                                         g_lastSettleChecks));
@@ -2130,7 +2222,7 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
       const float againCents = 1200.0f * log2f(again / fTarget);
       Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
                      " pair=" + p + " retry amp=" + ampNext +
-                     " freq=" + again + " dev=" + againCents + " cents" +
+                     " freq=" + fmt_freq(again) + " dev=" + againCents + " cents" +
                      " probes=" + g_lastFreqBisectProbes +
                      " settle=" + g_lastSettleChecks +
                      " (was " + cents + " cents at amp=" + ampFixed + ")");
@@ -2191,8 +2283,8 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     cal_report_set_pair_from_gap(p, info.gapUs, found, CAL_SRC_RUNG);
     highestTraced = p;
     Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
-                   " pair=" + p + " target=" + fTarget +
-                   " amp=" + ampFixed + " freq=" + found +
+                   " pair=" + p + " target=" + fmt_freq(fTarget) +
+                   " amp=" + ampFixed + " freq=" + fmt_freq(found) +
                    freq_trace_quality(info.gapUs, found, info.probes,
                                       info.settleChecks));
   }
@@ -2245,8 +2337,8 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     cal_report_set_pair_from_gap(p, info.gapUs, found, CAL_SRC_RUNG);
     lowestTraced  = p;
     Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
-                   " pair=" + p + " target=" + fTarget +
-                   " amp=" + ampFixed + " freq=" + found +
+                   " pair=" + p + " target=" + fmt_freq(fTarget) +
+                   " amp=" + ampFixed + " freq=" + fmt_freq(found) +
                    freq_trace_quality(info.gapUs, found, info.probes,
                                       info.settleChecks));
   }
@@ -2316,7 +2408,7 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
                                    CAL_SRC_ENDPOINT_FULL);
       Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
                      " top endpoint pair=" + topPair +
-                     " amp=" + DIV_COUNTER + " freq=" + endFreq +
+                     " amp=" + DIV_COUNTER + " freq=" + fmt_freq(endFreq) +
                      freq_trace_quality(g_lastFreqBisectGapUs, endFreq,
                                         g_lastFreqBisectProbes,
                                         g_lastSettleChecks));
@@ -2383,7 +2475,7 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     if (f0Est > f0CeilHz) f0Est = f0CeilHz;
     cal_report_set_pair(0, kCalDutyErrUnknown, CAL_SRC_FILLED);
     Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
-                   " bottom endpoint calculated: " + f0Est +
+                   " bottom endpoint calculated: " + fmt_freq(f0Est) +
                    " Hz (amp-0 hunt skipped, " +
                    ((calibrationPrecision == CAL_PRECISION_FAST)
                       ? "FAST run"
@@ -2403,7 +2495,7 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     }
     if (f0Est != raw) {
       Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
-                     " bottom endpoint seed " + raw + " -> " + f0Est +
+                     " bottom endpoint seed " + fmt_freq(raw) + " -> " + fmt_freq(f0Est) +
                      " Hz (band " + f0FloorHz + ".." + f0CeilHz + ")");
     }
   }
@@ -2415,30 +2507,35 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
       cal_report_set_pair_from_gap(0, g_lastFreqBisectGapUs, found,
                                    CAL_SRC_ENDPOINT_AMP0);
       Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
-                     " bottom endpoint amp=0 freq=" + found +
+                     " bottom endpoint amp=0 freq=" + fmt_freq(found) +
                      freq_trace_quality(g_lastFreqBisectGapUs, found,
                                         g_lastFreqBisectProbes,
                                         g_lastSettleChecks) +
                      " (seed=" + f0Est + ")");
       f0Est = found;
     } else {
-      // Store the model estimate itself, not the band-clamped seed: pair 0 is
-      // an interpolation anchor for the runtime lookup, not a note anyone
-      // plays, and the fitted intercept is what keeps the amp comp right for
-      // every note between it and pair 1. Only a sanity floor and the band
-      // ceiling apply (an estimate above pair 1 would break monotonicity).
-      float stored = f0Model;
+      // Prefer the amp-0 scan secant (the last frequency that actually
+      // bracketed a sign change) over the model intercept, which can sit
+      // below the pulse floor (~5.62 Hz fill vs a 7.93 Hz scan).
+      float stored = g_lastAmp0ScanSeedHz;
+      const char *srcName = "scan secant";
+      if (!(stored > 0.0f)) {
+        stored = f0Model;
+        srcName = "model estimate";
+      }
       if (!(stored > 0.0f)) stored = f0Est;
       if (stored < kAmp0StoreFloorHz) stored = kAmp0StoreFloorHz;
       if (stored > f0CeilHz) stored = f0CeilHz;
       f0Est = stored;
       cal_report_set_pair(0, kCalDutyErrUnknown, CAL_SRC_FILLED);
       Serial.println((String)"[FREQ_TRACE_GUARD] DCO=" + ctx.dcoIndex +
-                     " bottom endpoint rejected: best " + found + " Hz dutyErr=" +
+                     " bottom endpoint rejected: best " +
+                     ((found > 0.0f) ? fmt_freq(found) : String("n/a")) +
+                     " Hz dutyErr=" +
                      ((found > 0.0f) ? String(foundErr, 2) : String("n/a")) +
-                     "% (band " + f0FloorHz + ".." + f0CeilHz +
+                     "% (band " + fmt_freq(f0FloorHz) + ".." + fmt_freq(f0CeilHz) +
                      ", accept " + kEndpointAcceptDutyPct +
-                     "%); storing the model estimate " + f0Est);
+                     "%); storing the " + srcName + " " + fmt_freq(f0Est));
     }
   }
   }  // AMP0_MODE_MEASURE

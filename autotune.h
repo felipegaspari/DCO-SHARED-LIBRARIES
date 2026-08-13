@@ -176,6 +176,38 @@ static inline uint8_t cal_pw_channel(uint8_t osc) {
 uint8_t manualCalibrationStage;
 int8_t manualCalibrationOffset[NUM_OSCILLATORS] = { 0, 0, 0 };
 
+// Oscillator under trim. Packed DCO4 walk is not stage/3.
+static inline uint8_t cal_stage_to_osc(uint8_t stage) {
+  return cal_stage_to_osc_n(stage, NUM_OSCILLATORS);
+}
+static inline CalStageKind cal_stage_kind(uint8_t stage) {
+  return cal_stage_kind_n(stage, NUM_OSCILLATORS);
+}
+static inline bool cal_stage_is_440(uint8_t stage) {
+  return cal_stage_is_440_n(stage, NUM_OSCILLATORS);
+}
+static inline bool cal_stage_is_saw(uint8_t stage) {
+  return cal_stage_is_saw_n(stage, NUM_OSCILLATORS);
+}
+static inline bool cal_stage_is_tri(uint8_t stage) {
+  return cal_stage_is_tri_n(stage, NUM_OSCILLATORS);
+}
+static inline bool cal_stage_is_pw_edit(uint8_t stage) {
+  return cal_stage_is_pw_edit_n(stage, NUM_OSCILLATORS);
+}
+static inline bool cal_stage_is_square(uint8_t stage) {
+  return cal_stage_is_square_n(stage, NUM_OSCILLATORS);
+}
+static inline uint8_t cal_manual_osc() {
+  uint8_t osc = cal_stage_to_osc(manualCalibrationStage);
+  if (osc >= NUM_OSCILLATORS) osc = NUM_OSCILLATORS - 1;
+  return osc;
+}
+
+static inline uint8_t cal_stage_max() {
+  return cal_stage_max_n(NUM_OSCILLATORS);
+}
+
 // Manual calibration step (PARAM_MANUAL_CALIBRATION_STEP): 0 = trimpot stage
 // at the low starting note, 1 = 440 Hz amp-set stage (adjust ampComp440 until
 // duty = 50%). Reset to 0 on every manual-cal entry.
@@ -264,9 +296,32 @@ static inline float duty_err_pct_from_gap(float gapUs, float freqHz) {
   return 100.0f * gapUs * freqHz / 2.0e6f;
 }
 
+// Calibration logs: 3 decimal Hz. The stored table stays freq × 100 integers.
+static inline String fmt_freq(float hz) {
+  return String(hz, 3);
+}
+
 // Verification-sweep request (PARAM_DEBUG_COMMAND 36). Set on core 0; loop1
 // runs the sweep because every probe blocks on a duty measurement.
 volatile bool calibrationVerifyRequested = false;
+
+// PW CV probe request (PARAM_DEBUG_COMMAND 46). Set on core 0 while manual
+// calibration is running; loop1 runs it between two manual passes because each
+// step blocks on a duty measurement.
+volatile bool pwCvProbeRequested = false;
+
+// Manual calibration solos one oscillator by stopping every other state machine,
+// which a synced pair cannot survive: under hard sync the master's sideset owns
+// the slave's RESET pin, under soft sync the slave polls the master's pin, so a
+// stopped partner leaves the soloed oscillator unable to reset itself and it goes
+// silent. Manual cal walks with a neutral topology and puts the operator's choice
+// back on exit; these hold it meanwhile, and also absorb a sync change arriving
+// mid-walk (a preset load) so it cannot re-arm sync under the solo.
+uint8_t manualCalSavedSyncMode = 0;
+uint8_t manualCalSavedSoftSyncChunks = 0;
+// Rebuilding the topology touches PIO, so core 0 only asks: loop1's manual-cal
+// branch runs it, since that branch never reaches pio_defer_service().
+volatile bool calSyncNeutralRequested = false;
 
 // --- Implemented in autotune_impl.h ---
 
@@ -274,6 +329,7 @@ volatile bool calibrationVerifyRequested = false;
 void DCO_calibration();
 
 void run_calibration_verify_sweep();
+void run_pw_cv_probe();
 void cal_report_reset();
 void cal_report_set_pair(int pair, float dutyErrPct, uint8_t src);
 void cal_report_set_pair_from_gap(int pair, float gapUs, float freqHz, uint8_t src);
@@ -282,6 +338,11 @@ void print_calibration_report(uint8_t dcoIndex, const uint32_t *data);
 // Prepare the next oscillator's calibration run: seed its table header, reset
 // the per-DCO state and drive the start note.
 void restart_DCO_calibration();
+
+// Undo what a calibration run did to the oscillators: PW centers back, every SM
+// started same-cycle, voices retriggered. Manual cal reaches it from core 0
+// through pio_defer_request_cal_restore(), so it needs a declaration this early.
+static void restore_voice_engine_after_calibration();
 
 // PW calibration stages, called from the param handlers and the manual
 // calibration workflow. mode selects which note/voice the center search runs on.
@@ -315,12 +376,14 @@ float gapGateFreqHz = 0.0f;
 // counts as the largest possible move.
 float g_lastDrivenFreqHz = 0.0f;
 
-// Baseline manual amp-comp starting value for all oscillators.
-int8_t initManualAmpCompCalibrationValPreset = 35;
+// Baseline manual amp-comp starting value (PWM counts). 35 was measured at
+// wrap 14000; scale so analog duty stays the same if RANGE_PWM_WRAP changes.
+static constexpr uint16_t initManualAmpCompCalibrationValPreset =
+    (uint16_t)(35u * DIV_COUNTER / 14000u);
 // Per-oscillator baseline manual amp-comp starting values. Filled from the
 // preset on first use so the array size can follow NUM_OSCILLATORS (3 on
 // DCO3, 8 on DCO4) without a brace list that only covers the first three.
-int8_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
+uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
 
 static inline void autotune_fill_init_manual_amp() {
   static bool filled = false;
@@ -331,11 +394,13 @@ static inline void autotune_fill_init_manual_amp() {
   filled = true;
 }
 // Range-PWM value stored as the "lowest frequency" anchor in the calibration
-// table header (also persisted by FS.ino when seeding fake tables).
-volatile uint16_t ampCompLowestFreqVal = 10;
+// table header (also persisted by FS.ino when seeding fake tables). 10 was
+// measured at wrap 14000.
+volatile uint16_t ampCompLowestFreqVal = (uint16_t)(10u * DIV_COUNTER / 14000u);
 
-// Note from which DCO calibration starts (MIDI note index).
-static constexpr uint8_t DCO_calibration_start_note = 29; // 29 == C0
+// Note from which DCO calibration starts, in the offset convention described at
+// manual_cal_reference_note below (note 29 -> sNotePitches[17] = F0, 21.83 Hz).
+static constexpr uint8_t DCO_calibration_start_note = 29;
 // Interval in semitones between successive calibration notes.
 static constexpr uint8_t calibration_note_interval = 5;
 // Starting note used for the PW-centered calibration passes.
@@ -361,8 +426,10 @@ uint8_t DCO_calibration_current_note;
 // Global debug verbosity level for autotune routines.
 byte autotuneDebug = 4;
 
-// Convert a MIDI note number to its frequency in Hz.
-// sNotePitches[] starts at MIDI note 12, hence the offset.
+// Convert a calibration note number to its frequency in Hz. sNotePitches[]
+// starts at C-1 (standard MIDI 0), so the -12 makes every note number here name
+// a pitch an octave below the MIDI note of the same number - see the convention
+// note at manual_cal_reference_note above.
 static inline float note_to_freq(uint8_t midiNote) {
   return sNotePitches[midiNote - 12];
 }

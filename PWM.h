@@ -11,9 +11,9 @@
 #include "range_pwm_dither.pio.h"
 #endif
 
-static constexpr uint32_t RANGE_PIO_PERIOD = 4666;
 static constexpr uint32_t RANGE_PIO_FRAMES = 3;
-static constexpr uint32_t RANGE_PIO_LEVELS = RANGE_PIO_PERIOD * RANGE_PIO_FRAMES;  // 13998
+static constexpr uint32_t RANGE_PIO_PERIOD = DIV_COUNTER / RANGE_PIO_FRAMES;
+static constexpr uint32_t RANGE_PIO_LEVELS = RANGE_PIO_PERIOD * RANGE_PIO_FRAMES;
 
 void init_pwm();
 #ifdef RANGE0_PIO_DITHER_TEST
