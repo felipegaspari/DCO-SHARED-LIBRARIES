@@ -111,11 +111,7 @@ If a trimpot runs out of range, or a later calibration needs a small correction 
 
 The Input stage walk lands here automatically (no need to send **158**). The selected oscillator now runs a **square** at 440 Hz (PW at the calibrated center), so what you hear is the same waveform whose duty the readout measures.
 
-<<<<<<< HEAD
 - Adjust `PARAM_AMP_COMP_440` (**159**) — the absolute amp-comp value — until the duty readout is as close to 0 error as possible, exactly like the pulse trim but purely in software. On the Input panel the offset encoder sends 159 (step 10, or 1 with the function key), range `AMP_COMP_440_MIN..MAX` (`RANGE_PWM_WRAP/20` .. `/5`).
-=======
-- Adjust `PARAM_AMP_COMP_440` (**159**) — the absolute amp-comp value — until the duty readout is as close to 0 error as possible, exactly like the pulse trim but purely in software. On the Input panel the offset encoder sends 159 (step 10, or 1 with the function key), range **700..2800**.
->>>>>>> refs/remotes/origin/main
 - On first entry for an oscillator (stored value still 0) the firmware seeds a starting guess by scaling the step-0 operating point with the frequency ratio, so the oscillator starts near 50% rather than dead.
 - A measured curve puts a true 440 Hz somewhere around a tenth of `DIV_COUNTER`, so expect four figures — the panel slider spans `RANGE_PWM_WRAP/20` .. `/5` (`AMP_COMP_440_MIN..MAX`; at wrap 14000 that was 700..2800) for usable resolution around that. The firmware accepts 0..`DIV_COUNTER`, so a board outside the slider's range can still be driven over MIDI or from a stored table; the panel logs `[cal] osc n amp comp @ 440 Hz is …` when what it recalled does not fit on the slider.
 - This value is a **seed**, not a verdict: `FREQ_TRACE` re-measures it at the start of every run and writes back a correction if it was off (`[FREQ_TRACE_ANCHOR] … stored=… refined=…`). Getting it roughly right is enough.
