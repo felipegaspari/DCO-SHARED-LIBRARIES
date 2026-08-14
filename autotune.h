@@ -424,7 +424,7 @@ static constexpr uint8_t manual_cal_reference_note = 81;
 uint8_t DCO_calibration_current_note;
 
 // Global debug verbosity level for autotune routines.
-byte autotuneDebug = 4;
+byte autotuneDebug = 1;
 
 // Convert a calibration note number to its frequency in Hz. sNotePitches[]
 // starts at C-1 (standard MIDI 0), so the -12 makes every note number here name
