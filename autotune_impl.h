@@ -1,6 +1,7 @@
 #ifndef __AUTOTUNE_IMPL_H__
 #define __AUTOTUNE_IMPL_H__
 
+#include "hardware/watchdog.h"
 #include "autotune.h"
 #include "autotune_search_impl.h"
 
@@ -53,6 +54,50 @@ byte autotuneDebug = 2;
 
 static double g_gapLogCurrentPeriodUs = 0.0;
 static double g_gapLogTargetDutyFraction = 0.5;
+
+///////////////////////////////////
+// CALIBRATION SUMMARY STRUCTURES
+
+struct OscCalSummary {
+  bool     attempted;
+  bool     ok;
+  bool     cancelled;
+  uint8_t  pwCh;
+  bool     hasPW;
+  uint16_t pwCenter;
+  uint16_t pwLow;
+  uint16_t pwHigh;
+  uint16_t anchorAmp;
+  float    lowestHz;
+  float    highestHz;
+  float    avgDutyErrPct;
+  float    worstDutyErrPct;
+  int      worstPair;
+  float    worstHz;
+  uint32_t probes;
+  uint32_t elapsedMs;
+};
+
+static OscCalSummary g_oscSummary[NUM_OSCILLATORS];
+
+struct PWCalSummary {
+  bool     attempted;
+  bool     ok;
+  bool     cancelled;
+  uint8_t  ch;
+  uint8_t  pin;
+  uint16_t pwCenter;
+  double   centerDuty;
+  uint16_t pwLow;
+  double   lowDuty;
+  uint16_t pwHigh;
+  double   highDuty;
+  int      probes;
+  uint32_t elapsedMs;
+};
+
+static PWCalSummary g_pwSummary[NUM_PW_CHANNELS];
+
 
 // =============================================================================
 // Voice Engine & PWM Hardware Control Helpers
@@ -358,9 +403,6 @@ float find_gap(uint8_t specialMode) {
 }
 
 // =============================================================================
-// Pulse-Width (PW) Calibration Subsystem
-// =============================================================================
-// =============================================================================
 // Modern Pulse-Width (PW) Calibration Engine
 // =============================================================================
 
@@ -407,7 +449,7 @@ static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
   return duty;
 }
 
-// Low-level unified PW root-finder using Illinois Secant bisection
+// Low-level unified PW root-finder with Dead-Zone Edge Detection & 2-Point Regression
 PWSearchResult find_pw_for_target_duty(
   uint8_t  pwCh,
   double   targetDutyFraction,
@@ -425,39 +467,91 @@ PWSearchResult find_pw_for_target_duty(
   const CalPrecisionProfile &prec = cal_precision();
   const int maxProbes = prec.bisectIters;
 
-  // Bracket tracking: [pwLo, pwHi]
-  double pwLo = -1.0, pwHi = -1.0;
-  double errLo = 0.0, errHi = 0.0;
+  // Dynamic dead-zone boundaries (discovered when pulses collapse into timeouts)
+  int32_t deadLowPW  = (int32_t)pwMin - 1;
+  int32_t deadHighPW = (int32_t)pwMax + 1;
 
+  bool     haveValid  = false;
   uint16_t bestPW     = pwSeed;
   double   bestDuty   = -1.0;
   double   bestAbsErr = 1e9;
 
-  double   curPW = (double)constrain(pwSeed, pwMin, pwMax);
-  uint16_t step  = max(1, (int)((pwMax - pwMin) / 16));
-  int      lastSide = 0;
+  // 2-Point history of valid measurements for slope calculation
+  int32_t p0_pw = -1, p1_pw = -1;
+  double  p0_duty = 0.0, p1_duty = 0.0;
+
+  double curPW = (double)constrain(pwSeed, pwMin, pwMax);
 
   for (int probe = 0; probe < maxProbes; ++probe) {
-    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 60000UL)) break;
+    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 30000UL)) break;
 
-    uint16_t testPW = (uint16_t)lround(curPW);
-    testPW = constrain(testPW, pwMin, pwMax);
+    int32_t testPW32 = (int32_t)lround(curPW);
+    testPW32 = constrain(testPW32, (int32_t)pwMin, (int32_t)pwMax);
 
+    // Keep testPW strictly inside the known-alive window
+    if (testPW32 <= deadLowPW)  testPW32 = deadLowPW + 1;
+    if (testPW32 >= deadHighPW) testPW32 = deadHighPW - 1;
+
+    // If the alive window is exhausted, no further improvement is possible
+    if (testPW32 <= deadLowPW || testPW32 >= deadHighPW || testPW32 < (int32_t)pwMin || testPW32 > (int32_t)pwMax) {
+      if (autotuneDebug >= 2) {
+        Serial.println((String)"  [PW_EXHAUSTED] Working window fully explored. Dead bounds: [" +
+        deadLowPW + " .. " + deadHighPW + "]");
+      }
+      break;
+    }
+
+    uint16_t testPW = (uint16_t)testPW32;
     double duty = measure_pw_duty(pwCh, testPW, freqHz);
     res.probes++;
 
+    // -------------------------------------------------------------------------
+    // CASE 1: TIMEOUT / PULSE COLLAPSED
+    // -------------------------------------------------------------------------
     if (duty < 0.0) {
-      // Pulse collapsed at this extreme; back off toward center
-      if (curPW > (pwMin + pwMax) / 2.0) {
-        curPW -= step;
+      if (haveValid) {
+        if (testPW < bestPW) {
+          deadLowPW = max(deadLowPW, (int32_t)testPW);
+          // If the dead count is immediately adjacent to our best working pulse,
+          // we have reached the absolute physical edge of the comparator!
+          if (bestPW - deadLowPW <= 1 && targetDutyFraction < bestDuty) {
+            if (autotuneDebug >= 2) {
+              Serial.println((String)"  [PW_EDGE_LOCK] Reached lowest physical pulse limit at PW=" + bestPW +
+              " (duty=" + String(bestDuty * 100.0, 2) + "%). Dead zone at PW=" + deadLowPW);
+            }
+            break; // Stop immediately, best possible pulse is locked
+          }
+          curPW = (double)(bestPW + deadLowPW) / 2.0; // Bisect toward safety
+        } else {
+          deadHighPW = min(deadHighPW, (int32_t)testPW);
+          if (deadHighPW - bestPW <= 1 && targetDutyFraction > bestDuty) {
+            if (autotuneDebug >= 2) {
+              Serial.println((String)"  [PW_EDGE_LOCK] Reached highest physical pulse limit at PW=" + bestPW +
+              " (duty=" + String(bestDuty * 100.0, 2) + "%). Dead zone at PW=" + deadHighPW);
+            }
+            break; // Stop immediately
+          }
+          curPW = (double)(bestPW + deadHighPW) / 2.0; // Bisect toward safety
+        }
       } else {
-        curPW += step;
+        // No valid point seen yet: step toward center of allowed range
+        double centerApprox = (double)(pwMin + pwMax) / 2.0;
+        if (testPW < centerApprox) {
+          deadLowPW = max(deadLowPW, (int32_t)testPW);
+          curPW = (double)(testPW + centerApprox) / 2.0;
+        } else {
+          deadHighPW = min(deadHighPW, (int32_t)testPW);
+          curPW = (double)(testPW + centerApprox) / 2.0;
+        }
       }
-      step = max(1, step / 2);
       continue;
     }
 
-    double err = duty - targetDutyFraction; // Signed error
+    // -------------------------------------------------------------------------
+    // CASE 2: VALID MEASUREMENT
+    // -------------------------------------------------------------------------
+    haveValid = true;
+    double err = duty - targetDutyFraction;
     double absErr = fabs(err);
 
     if (absErr < bestAbsErr) {
@@ -467,57 +561,65 @@ PWSearchResult find_pw_for_target_duty(
     }
 
     if (autotuneDebug >= 2) {
-      Serial.println((String)"[PW_SEARCH] ch=" + pwCh + " PW=" + testPW +
-                     " duty=" + String(duty * 100.0, 2) + "% target=" +
-                     String(targetDutyFraction * 100.0, 1) + "% err=" +
-                     String(err * 100.0, 3) + "% tol=±" +
-                     String(dutyToleranceFraction * 100.0, 2) + "%");
+      Serial.println((String)"  [PW_PROBE] PW=" + testPW + " duty=" + String(duty * 100.0, 2) +
+      "% (target=" + String(targetDutyFraction * 100.0, 1) +
+      "% err=" + String(err * 100.0, 3) + "%)");
     }
 
+    // Target achieved within tolerance
     if (absErr <= dutyToleranceFraction) {
-      break; // Converged within target tolerance
+      break;
     }
 
-    // Bracket formation & Illinois Secant step
-    int side = (err > 0.0) ? 1 : -1;
+    // Physical boundary limit check: if target wants lower duty, but next lower count is dead
+    if (err > 0.0 && (int32_t)testPW <= deadLowPW + 1) {
+      if (autotuneDebug >= 2) {
+        Serial.println((String)"  [PW_EDGE_LOCK] Target unreachable (requires dead PW < " + (deadLowPW + 1) +
+        "). Keeping best valid PW=" + testPW);
+      }
+      break;
+    }
+    // Physical boundary limit check: if target wants higher duty, but next higher count is dead
+    if (err < 0.0 && (int32_t)testPW >= deadHighPW - 1) {
+      if (autotuneDebug >= 2) {
+        Serial.println((String)"  [PW_EDGE_LOCK] Target unreachable (requires dead PW > " + (deadHighPW - 1) +
+        "). Keeping best valid PW=" + testPW);
+      }
+      break;
+    }
 
-    if (side > 0) {
-      pwHi = (double)testPW; errHi = err;
+    // Update 2-point valid history for regression
+    if (p0_pw < 0) {
+      p0_pw = testPW; p0_duty = duty;
+    } else if (p1_pw < 0 && testPW != p0_pw) {
+      p1_pw = testPW; p1_duty = duty;
+    } else if (testPW != p1_pw) {
+      p0_pw = p1_pw;  p0_duty = p1_duty;
+      p1_pw = testPW; p1_duty = duty;
+    }
+
+    // Calculate next candidate via measured slope regression
+    if (p0_pw >= 0 && p1_pw >= 0 && fabs(p1_duty - p0_duty) > 1e-4) {
+      double slope = (p1_duty - p0_duty) / (double)(p1_pw - p0_pw);
+      double estPW = (double)testPW + (targetDutyFraction - duty) / slope;
+
+      // Damping: prevent huge jumps from noise
+      double maxJump = (double)(pwMax - pwMin) * 0.35;
+      if (estPW < curPW - maxJump) estPW = curPW - maxJump;
+      if (estPW > curPW + maxJump) estPW = curPW + maxJump;
+
+      curPW = estPW;
     } else {
-      pwLo = (double)testPW; errLo = err;
-    }
-
-    if (side == lastSide) {
-      if (side > 0 && pwLo >= 0.0) errLo *= 0.5; // Illinois damping
-      if (side < 0 && pwHi >= 0.0) errHi *= 0.5;
-    }
-    lastSide = side;
-
-    if (pwLo >= 0.0 && pwHi >= 0.0) {
-      if (fabs(pwHi - pwLo) <= 1.0) break; // Exhausted integer resolution
-
-      double denom = errHi - errLo;
-      double nextPW = (fabs(denom) > 1e-6)
-                        ? (pwLo - errLo * (pwHi - pwLo) / denom)
-                        : (0.5 * (pwLo + pwHi));
-
-      double guard = 0.1 * (pwHi - pwLo);
-      if (nextPW < pwLo + guard) nextPW = pwLo + guard;
-      if (nextPW > pwHi - guard) nextPW = pwHi - guard;
-
-      curPW = nextPW;
-    } else {
-      // Step outward linearly based on expected slope
-      double deltaPW = -err * (double)(pwMax - pwMin);
-      if (fabs(deltaPW) < (double)step) deltaPW = (err > 0) ? -step : step;
-      curPW += deltaPW;
-      curPW = constrain(curPW, (double)pwMin, (double)pwMax);
-      step = max(1, step / 2);
+      // Baseline proportional step
+      double delta = (targetDutyFraction - duty) * (double)(pwMax - pwMin);
+      curPW = (double)testPW + delta;
     }
   }
 
-  // Confirmation Averaging Phase
-  if (bestDuty >= 0.0) {
+  // ---------------------------------------------------------------------------
+  // CONFIRMATION AVERAGING PHASE
+  // ---------------------------------------------------------------------------
+  if (haveValid && bestDuty >= 0.0) {
     int confirmReads = max(1, (int)prec.confirmReads);
     double sumDuty = 0.0;
     int validReads = 0;
@@ -532,7 +634,6 @@ PWSearchResult find_pw_for_target_duty(
 
     if (validReads > 0) {
       bestDuty = sumDuty / (double)validReads;
-      bestAbsErr = fabs(bestDuty - targetDutyFraction);
     }
 
     res.ok        = true;
@@ -591,6 +692,10 @@ void find_PW_center(uint8_t mode) {
     PW_CENTER[pwCh] = res.pw;
     update_FS_PWCenter(pwCh, res.pw);
     apply_pw_center(pwCh);
+
+    // Save achieved duty for the PW summary table
+    g_pwSummary[pwCh].pwCenter   = res.pw;
+    g_pwSummary[pwCh].centerDuty = res.duty;
 
     Serial.println((String)"[PW_CENTER_RESULT] ch=" + pwCh + " PW_CENTER=" + res.pw +
     " duty=" + String(res.duty * 100.0, 2) + "% err=" +
@@ -653,15 +758,17 @@ void find_PW_limit_v2(PWLimitDir dir) {
     if (dir == PW_LIMIT_LOW) {
       PW_LOW_LIMIT[pwCh] = res.pw;
       update_FS_PW_Low_Limit(pwCh, res.pw);
+      g_pwSummary[pwCh].pwLow   = res.pw;
+      g_pwSummary[pwCh].lowDuty = res.duty;
     } else {
       PW_HIGH_LIMIT[pwCh] = res.pw;
       update_FS_PW_High_Limit(pwCh, res.pw);
+      g_pwSummary[pwCh].pwHigh   = res.pw;
+      g_pwSummary[pwCh].highDuty = res.duty;
     }
 
     Serial.println((String)"[" + tag + "_RESULT] ch=" + pwCh + " LIMIT=" + res.pw +
     " duty=" + String(res.duty * 100.0, 2) + "% (" + res.probes + " probes)");
-  } else {
-    Serial.println((String)"[" + tag + "_FAIL] ch=" + pwCh + " keeping previous=" + finalLimitPW);
   }
 
   // Restore center after sweep
@@ -828,28 +935,6 @@ void print_calibration_report(uint8_t dcoIndex, const uint32_t *data) {
 // Multi-Oscillator Side-by-Side Summary Report Table
 // =============================================================================
 
-struct OscCalSummary {
-  bool     attempted;
-  bool     ok;
-  bool     cancelled;
-  uint8_t  pwCh;
-  bool     hasPW;
-  uint16_t pwCenter;
-  uint16_t pwLow;
-  uint16_t pwHigh;
-  uint16_t anchorAmp;
-  float    lowestHz;
-  float    highestHz;
-  float    avgDutyErrPct;
-  float    worstDutyErrPct;
-  int      worstPair;
-  float    worstHz;
-  uint32_t probes;
-  uint32_t elapsedMs;
-};
-
-static OscCalSummary g_oscSummary[NUM_OSCILLATORS];
-
 static String cal_col(const String& s, int width, bool rightAlign = true) {
   String out = s;
   if ((int)out.length() > width) {
@@ -942,6 +1027,100 @@ static void print_multi_osc_summary_table(uint8_t scope, uint8_t precision, uint
   " | Total Duration: " + String(totalTimeMs / 1000.0f, 1) + "s");
   Serial.println("======================================================================================================================\n");
 }
+
+
+// =============================================================================
+// Dedicated PW Calibration Summary Structures & Report Table
+// =============================================================================
+
+// Print dedicated PW-only summary table
+static void print_pw_summary_table() {
+  Serial.println("\n======================================================================================================================");
+  Serial.println("[PW_SUMMARY] FINAL PULSE-WIDTH (PW) CALIBRATION REPORT  (Reference: 440.0 Hz / Note 81)");
+  Serial.println("======================================================================================================================");
+  Serial.println(" Ch | Pin  | Oscs  | Status |   PW_CENTER (Duty)   |    PW_LOW (Duty)     |    PW_HIGH (Duty)    | Span | Probes | Time ");
+  Serial.println("----+------+-------+--------+----------------------+----------------------+----------------------+------+--------+------");
+
+  int successCount = 0;
+  int totalProbes  = 0;
+  uint32_t totalTimeMs = 0;
+
+  int oscsPerCh = NUM_OSCILLATORS / NUM_PW_CHANNELS;
+
+  for (int ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    const PWCalSummary& s = g_pwSummary[ch];
+    totalProbes += s.probes;
+    totalTimeMs += s.elapsedMs;
+
+    if (s.pin == PW_PIN_UNASSIGNED) continue;
+
+    String line = " " + cal_col(String(ch), 2, true) + " | ";
+    line += cal_col("GP" + String(s.pin), 4, false) + " | ";
+
+    int firstOsc = ch * oscsPerCh;
+    int lastOsc  = firstOsc + oscsPerCh - 1;
+    String oscStr = (firstOsc == lastOsc) ? String(firstOsc) : (String(firstOsc) + ", " + String(lastOsc));
+    line += cal_col(oscStr, 5, false) + " | ";
+
+    if (s.cancelled) {
+      line += cal_col("CANCEL", 6, false) + " | ";
+    } else if (!s.attempted) {
+      line += cal_col("SKIP", 6, false) + " | ";
+    } else if (s.ok) {
+      line += cal_col("OK", 6, false) + " | ";
+      successCount++;
+    } else {
+      line += cal_col("FAILED", 6, false) + " | ";
+    }
+
+    // Center Duty string (Target 50%)
+    if (s.centerDuty >= 0.0) {
+      double dev = (s.centerDuty - kPWCenterDutyFraction) * 100.0;
+      String cStr = String(s.pwCenter) + " (" + String(s.centerDuty * 100.0, 2) + "%" +
+      (dev >= 0.0 ? " +" : " ") + String(dev, 2) + "%)";
+      line += cal_col(cStr, 20, false) + " | ";
+    } else {
+      line += cal_col(String(s.pwCenter), 20, false) + " | ";
+    }
+
+    // Low Duty string (Target 2%)
+    if (s.lowDuty >= 0.0) {
+      double dev = (s.lowDuty - kPWLowDutyFraction) * 100.0;
+      String lStr = String(s.pwLow) + " (" + String(s.lowDuty * 100.0, 2) + "%" +
+      (dev >= 0.0 ? " +" : " ") + String(dev, 2) + "%)";
+      line += cal_col(lStr, 20, false) + " | ";
+    } else {
+      line += cal_col(String(s.pwLow), 20, false) + " | ";
+    }
+
+    // High Duty string (Target 98%)
+    if (s.highDuty >= 0.0) {
+      double dev = (s.highDuty - kPWHighDutyFraction) * 100.0;
+      String hStr = String(s.pwHigh) + " (" + String(s.highDuty * 100.0, 2) + "%" +
+      (dev >= 0.0 ? " +" : " ") + String(dev, 2) + "%)";
+      line += cal_col(hStr, 20, false) + " | ";
+    } else {
+      line += cal_col(String(s.pwHigh), 20, false) + " | ";
+    }
+
+    // Usable PWM Span
+    uint16_t span = (s.pwHigh > s.pwLow) ? (s.pwHigh - s.pwLow) : 0;
+    line += cal_col(String(span), 4, true) + " | ";
+
+    // Probes & Time
+    line += cal_col(String(s.probes), 6, true) + " | ";
+    line += cal_col(String(s.elapsedMs / 1000.0f, 1) + "s", 4, true);
+
+    Serial.println(line);
+  }
+
+  Serial.println("======================================================================================================================");
+  Serial.println((String)"Summary: " + successCount + "/" + NUM_PW_CHANNELS +
+  " PW Channels Calibrated Successfully | Total Probes: " + totalProbes +
+  " | Total Duration: " + String(totalTimeMs / 1000.0f, 1) + "s");
+  Serial.println("======================================================================================================================\n");
+}
+
 // =============================================================================
 // Diagnostic Sweeps, Probes & Manual Gap Tracking
 // =============================================================================
@@ -1095,7 +1274,24 @@ void DCO_calibration() {
   const bool    runAmp    = calibration_scope_runs_amp(scope);
   const bool    fine      = (calibrationPrecision == CAL_PRECISION_FINE);
 
-  // Initialize summary tracking
+  // Initialize PW Summary tracking
+  for (int ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    g_pwSummary[ch].attempted  = false;
+    g_pwSummary[ch].ok         = false;
+    g_pwSummary[ch].cancelled  = false;
+    g_pwSummary[ch].ch         = ch;
+    g_pwSummary[ch].pin        = PW_PINS[ch];
+    g_pwSummary[ch].pwCenter   = PW_CENTER[ch];
+    g_pwSummary[ch].centerDuty = -1.0;
+    g_pwSummary[ch].pwLow      = PW_LOW_LIMIT[ch];
+    g_pwSummary[ch].lowDuty    = -1.0;
+    g_pwSummary[ch].pwHigh     = PW_HIGH_LIMIT[ch];
+    g_pwSummary[ch].highDuty   = -1.0;
+    g_pwSummary[ch].probes     = 0;
+    g_pwSummary[ch].elapsedMs  = 0;
+  }
+
+  // Initialize Amp/Full Summary tracking
   for (int i = 0; i < NUM_OSCILLATORS; ++i) {
     uint8_t ch = cal_pw_channel(i);
     g_oscSummary[i].attempted       = false;
@@ -1111,6 +1307,8 @@ void DCO_calibration() {
     g_oscSummary[i].highestHz       = 0.0f;
     g_oscSummary[i].avgDutyErrPct   = -1.0f;
     g_oscSummary[i].worstDutyErrPct = -1.0f;
+    g_oscSummary[i].worstPair       = -1;
+    g_oscSummary[i].worstHz         = 0.0f;
     g_oscSummary[i].probes          = 0;
     g_oscSummary[i].elapsedMs       = 0;
   }
@@ -1131,23 +1329,18 @@ void DCO_calibration() {
   }
   Serial.println("=======================================================\n");
 
-  // =========================================================================
-  // THE CRITICAL FIX: THE GLOBAL ANALOG DRAIN PHASE
-  // =========================================================================
+  // Global analog drain phase
   Serial.println("[DCO_CAL] ---> DRAINING ANALOG BUS (Waiting for RC filters to reach 0V)...");
   disable_all_oscillators_and_range_pwm();
-
-  // Wait 2.5 seconds to guarantee all capacitors bleed completely dry.
-  // This physically mirrors the time it takes a human to click through to Manual Calibration.
   delay(2500);
-
   Serial.println("[DCO_CAL] ---> Analog bus stabilized. Beginning individual DCO tuning.\n");
-  // =========================================================================
 
   bool anyTableUpdated = false;
   bool allSucceeded    = true;
 
+  // ---------------------------------------------------------------------------
   // 1. PW Calibration Stage
+  // ---------------------------------------------------------------------------
   if (runPW && !calibrationCancelRequested) {
     Serial.println("\n[DCO_CAL] ---> Starting PW Calibration Stage");
     uint8_t lastCh = 0xFF;
@@ -1160,26 +1353,38 @@ void DCO_calibration() {
       lastCh = ch;
       currentDCO = osc;
 
+      g_pwSummary[ch].attempted = true;
+      uint32_t pwChStartMs = millis();
+      int probesBefore = calRunProbes;
+
       Serial.println((String)"\n[DCO_CAL] Calibrating PW for Channel " + ch + " (Osc " + osc + ")");
       restart_DCO_calibration();
-      DCO_calibration_current_note = manual_DCO_calibration_start_note;
+      DCO_calibration_current_note = manual_cal_reference_note;
       VOICE_NOTES[0] = DCO_calibration_current_note;
 
       find_PW_center(0);
       if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_LOW);
       if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_HIGH);
 
-      for (int k = 0; k < NUM_OSCILLATORS; ++k) {
-        if (cal_pw_channel(k) == ch) {
-          g_oscSummary[k].pwCenter = PW_CENTER[ch];
-          g_oscSummary[k].pwLow    = PW_LOW_LIMIT[ch];
-          g_oscSummary[k].pwHigh   = PW_HIGH_LIMIT[ch];
-        }
+      g_pwSummary[ch].pwCenter  = PW_CENTER[ch];
+      g_pwSummary[ch].pwLow     = PW_LOW_LIMIT[ch];
+      g_pwSummary[ch].pwHigh    = PW_HIGH_LIMIT[ch];
+      g_pwSummary[ch].probes    = calRunProbes - probesBefore;
+      g_pwSummary[ch].elapsedMs = millis() - pwChStartMs;
+
+      if (calibrationCancelRequested) {
+        g_pwSummary[ch].cancelled = true;
+        allSucceeded = false;
+        break;
       }
+
+      g_pwSummary[ch].ok = true;
     }
   }
 
+  // ---------------------------------------------------------------------------
   // 2. Amp Compensation Calibration Stage
+  // ---------------------------------------------------------------------------
   if (runAmp && !calibrationCancelRequested) {
     Serial.println("\n[DCO_CAL] ---> Starting Amp Compensation Stage");
     for (int i = 0; i < NUM_OSCILLATORS; i++) {
@@ -1275,17 +1480,18 @@ void DCO_calibration() {
     }
   }
 
-  // Mark skipped oscillators if interrupted early
-  for (int i = 0; i < NUM_OSCILLATORS; ++i) {
-    if (!g_oscSummary[i].attempted && !g_oscSummary[i].cancelled) {
-      if (calibrationCancelRequested) g_oscSummary[i].cancelled = true;
-    }
+  // ---------------------------------------------------------------------------
+  // 3. Final Summary Report Selection
+  // ---------------------------------------------------------------------------
+  if (scope == CAL_SCOPE_PW) {
+    print_pw_summary_table(); // Specific report for PW-only calibration
+  } else if (scope == CAL_SCOPE_AMP) {
+    print_multi_osc_summary_table(scope, calibrationPrecision, autotuneAmpMethod); // Amp report
+  } else {
+    // FULL run: print both PW and Multi-Oscillator reports
+    print_pw_summary_table();
+    print_multi_osc_summary_table(scope, calibrationPrecision, autotuneAmpMethod);
   }
-
-  // ---------------------------------------------------------------------------
-  // 3. Final Summary Report & Exit Clean-Up
-  // ---------------------------------------------------------------------------
-  print_multi_osc_summary_table(scope, calibrationPrecision, autotuneAmpMethod);
 
   if (calibrationCancelRequested) {
     Serial.println("\n=======================================================");
@@ -1293,11 +1499,11 @@ void DCO_calibration() {
     Serial.println("=======================================================\n");
   } else if (!allSucceeded) {
     Serial.println("\n=======================================================");
-    Serial.println("[DCO_CAL] *** CALIBRATION FINISHED WITH ERRORS (SOME DCOs FAILED) ***");
+    Serial.println("[DCO_CAL] *** CALIBRATION FINISHED WITH ERRORS ***");
     Serial.println("=======================================================\n");
   } else {
     Serial.println("\n=======================================================");
-    Serial.println("[DCO_CAL] *** CALIBRATION FINISHED SUCCESSFULLY (ALL DCOs OK) ***");
+    Serial.println("[DCO_CAL] *** CALIBRATION FINISHED SUCCESSFULLY ***");
     Serial.println("=======================================================\n");
   }
 
@@ -1306,15 +1512,27 @@ void DCO_calibration() {
     precompute_amp_comp_for_engine();
   }
 
-  calibrationFlag = false;
+  calibrationFlag            = false;
   calibrationCancelRequested = false;
   restore_voice_engine_after_calibration();
 
-  // =========================================================================
-  // CRITICAL: Release the Motherboard from Calibration Mode
-  // Sends Param 150 = 0 back to the Mainboard so it restores standard polyphony
-  // =========================================================================
+  // Release Motherboard from Calibration Mode
   serialSendParam32(PARAM_CALIBRATION_FLAG, 0, true);
+  serialSendParam32(PARAM_GAP_FROM_DCO, 0, true);
+
+  Serial.println("[DCO_CAL] Rebooting Pi Pico for clean polyphonic engine startup...");
+  Serial.flush();
+
+  // 2. Short delay to allow Serial/UART DMA to finish transmitting packets
+  delay(1000);
+
+  if (allSucceeded) {
+    // 3. Trigger clean hardware warm-reboot of both RP2040 cores
+    watchdog_reboot(0, 0, 0);
+    while (true) {
+      tight_loop_contents();
+    }
+  }
 }
 
 #endif  // __AUTOTUNE_IMPL_H__
