@@ -245,9 +245,13 @@ static void wait_periods(float freqHz, float periods, uint32_t minUs) {
 }
 
 static void drive_freq(float freqHz, uint16_t amp) {
-  calibrationFreqHz  = freqHz;
+  calibrationFreqHz     = freqHz;
+  ampCompCalibrationVal = amp;
+
+  // EXPLICITLY PROGRAM THE RANGE PWM SLICE HARDWARE
+  write_range_pwm(currentDCO, amp);
   voice_task_autotune(4, amp);
-  g_lastDrivenFreqHz = freqHz;
+  g_lastDrivenFreqHz    = freqHz;
 }
 
 static float search_step_cap_cents(float freqHz) {
@@ -302,6 +306,11 @@ float measure_duty_at_freq(float freqHz, uint16_t amp, bool hiRes) {
     gm = measure_gap(mode);
   }
   if (gm.timedOut) {
+    if (autotuneDebug >= 2) {
+      Serial.println((String)"  [FREQ_PROBE] DCO=" + currentDCO + " Freq=" + fmt_freq(freqHz) + "Hz" +
+      " TargetAMP=" + amp + " (HW RangeCC=" + range_level_readback(currentDCO) +
+      " PW_CC=" + pw_level_readback(cal_pw_channel(currentDCO)) + ") -> TIMEOUT");
+    }
     gapGateFreqHz = 0.0f;
     return kGapTimeoutSentinel;
   }
@@ -340,7 +349,14 @@ float measure_duty_at_freq(float freqHz, uint16_t amp, bool hiRes) {
   if (!settled && amp == 0) g_lastDutyUnsettled = true;
   gapGateFreqHz = 0.0f;
 
-  return -(value - duty_trim_gap_us(currentDCO, freqHz));
+  float result = -(value - duty_trim_gap_us(currentDCO, freqHz));
+  if (autotuneDebug >= 2) {
+    Serial.println((String)"  [FREQ_PROBE] DCO=" + currentDCO + " Freq=" + fmt_freq(freqHz) + "Hz" +
+    " TargetAMP=" + amp + " (HW RangeCC=" + range_level_readback(currentDCO) +
+    " PW_CC=" + pw_level_readback(cal_pw_channel(currentDCO)) + ")" +
+    " -> GapUs=" + result + " DutyErr=" + String(duty_err_pct_from_gap(result, freqHz), 3) + "%");
+  }
+  return result;
 }
 
 float find_freq_for_duty50(uint16_t amp, float freqGuess, float windowRatio, bool refine, const FreqSearchBounds *bounds) {
@@ -534,6 +550,7 @@ static FreqSearchBounds amp0_search_band(float firstPairHz) {
 static float scan_duty_at_freq(float freqHz, uint16_t amp) {
   ampCompCalibrationVal = amp;
   gapGateFreqHz = freqHz;
+
   drive_freq(freqHz, amp);
 
   uint32_t settleMs = kAmp0ScanSettleMs;
@@ -702,44 +719,105 @@ float find_lowest_freq() {
 
 static float measure_gap_for_amp(uint16_t ampPwm) {
   const float freqHz = note_to_freq(DCO_calibration_current_note);
+  ampCompCalibrationVal = ampPwm;
+
+  // EXPLICITLY PROGRAM THE RANGE PWM SLICE HARDWARE
+  write_range_pwm(currentDCO, ampPwm);
   voice_task_autotune(0, ampPwm);
   settle_for_freq((double)freqHz);
   ++calRunProbes;
+
   GapMeasurement gm = measure_gap(0);
-  if (gm.timedOut) return kGapTimeoutSentinel;
-  return -(gm.value - duty_trim_gap_us(currentDCO, freqHz));
+
+  if (gm.timedOut) {
+    if (autotuneDebug >= 2) {
+      Serial.println((String)"  [AMP_PROBE] DCO=" + currentDCO + " TargetAMP=" + ampPwm +
+      " (HW RangeCC=" + range_level_readback(currentDCO) + ") -> TIMEOUT");
+    }
+    return kGapTimeoutSentinel;
+  }
+
+  float result = -(gm.value - duty_trim_gap_us(currentDCO, freqHz));
+  if (autotuneDebug >= 2) {
+    double dutyErrPct = duty_err_pct_from_gap(result, freqHz);
+    Serial.println((String)"  [AMP_PROBE] DCO=" + currentDCO + " TargetAMP=" + ampPwm +
+    " (HW RangeCC=" + range_level_readback(currentDCO) + ")" +
+    " -> GapUs=" + result + " DutyErr=" + String(dutyErrPct, 3) + "%");
+  }
+  return result;
 }
 
-static uint16_t compute_initial_amp_for_note(const DCOCalibrationContext& ctx, int j) {
+// Helper: compute initial amplitude (range PWM) guess with strict anti-runaway clamping
+static uint16_t compute_initial_amp_for_note(
+  const DCOCalibrationContext& ctx,
+  int j
+) {
+  float guess = 0.0f;
+  float prevAmp = (j >= 6) ? (float)ctx.calibrationData[j - 1] : (float)ctx.calibrationData[3];
+  if (prevAmp < 1.0f) prevAmp = (float)ctx.initManualAmpByOsc[ctx.dcoIndex];
+
   if (j == 4) {
-    return (ctx.initManualAmpByOsc[ctx.dcoIndex] + ctx.manualOffsetByOsc[ctx.dcoIndex]) * 1.35;
+    guess = (float)(ctx.initManualAmpByOsc[ctx.dcoIndex] + ctx.manualOffsetByOsc[ctx.dcoIndex]) * 1.35f;
   } else if (j == 6) {
-    return logarithmicInterpolation(ctx.calibrationData[2], ctx.calibrationData[3],
-                                    ctx.calibrationData[4], ctx.calibrationData[5],
-                                    note_to_freq(ctx.currentNote) * 100);
+    guess = (float)logarithmicInterpolation(
+      ctx.calibrationData[2],
+      ctx.calibrationData[3],
+      ctx.calibrationData[4],
+      ctx.calibrationData[5],
+      note_to_freq(ctx.currentNote) * 100.0f
+    );
   } else {
-    return quadraticInterpolation(ctx.calibrationData[j - 6], ctx.calibrationData[j - 5],
-                                  ctx.calibrationData[j - 4], ctx.calibrationData[j - 3],
-                                  ctx.calibrationData[j - 2], ctx.calibrationData[j - 1],
-                                  note_to_freq(ctx.currentNote) * 100);
+    guess = quadraticInterpolation(
+      (float)ctx.calibrationData[j - 6], (float)ctx.calibrationData[j - 5],
+                                   (float)ctx.calibrationData[j - 4], (float)ctx.calibrationData[j - 3],
+                                   (float)ctx.calibrationData[j - 2], (float)ctx.calibrationData[j - 1],
+                                   note_to_freq(ctx.currentNote) * 100.0f
+    );
   }
+
+  // Anti-Runaway Clamp:
+  // For a 5-semitone interval (~1.33x freq), amp comp should realistically grow by 1.1x to 1.6x.
+  // If the polynomial dips negative, is NaN, or explodes higher than 1.8x, fall back to safe scaling.
+  if (isnan(guess) || guess < prevAmp || guess > (prevAmp * 1.8f)) {
+    guess = prevAmp * 1.33f;
+  }
+
+  if (guess < 1.0f) guess = 1.0f;
+  if (guess > (float)DIV_COUNTER) guess = (float)DIV_COUNTER;
+
+  return (uint16_t)lroundf(guess);
 }
 
 void calibrate_DCO(DCOCalibrationContext& ctx, double dutyErrorFraction) {
   const int rangeSamples = 2;
   const int numPresetVoltages = chanLevelVoiceDataSize;
-  const int kMaxSearchIterations = 300;
-  const unsigned long kMaxNoteSearchMs = 30000;
+  const int kMaxSearchIterations = 150;
+  const unsigned long kMaxNoteSearchMs = 25000;
   const int kMaxConsecutiveTimeouts = 20;
+
+  Serial.println((String)"\n=======================================================");
+  Serial.println((String)"[DCO_CAL] Starting Classic Amp Calibration for DCO=" + ctx.dcoIndex);
+  Serial.println("=======================================================");
 
   for (int j = 4; j < numPresetVoltages; j += 2) {
     if (calibrationCancelRequested) return;
 
     ctx.currentNote = DCO_calibration_start_note + (calibration_note_interval * (j - 4) / 2);
     VOICE_NOTES[0] = ctx.currentNote;
-    uint16_t currentAmpCompCalibrationVal = compute_initial_amp_for_note(ctx, j);
 
-    if (currentAmpCompCalibrationVal > DIV_COUNTER * 0.98) {
+    uint16_t initialAmpGuess = compute_initial_amp_for_note(ctx, j);
+    uint16_t currentAmpCompCalibrationVal = initialAmpGuess;
+
+    const double freqHz = note_to_freq(ctx.currentNote);
+    double tolerance = compute_gap_tolerance_for_freq(freqHz, dutyErrorFraction);
+    const double periodUs = (freqHz > 0.0) ? (1000000.0 / freqHz) : 0.0;
+
+    Serial.println((String)"\n--- [DCO=" + ctx.dcoIndex + " Note=" + ctx.currentNote +
+    " (" + fmt_freq((float)freqHz) + " Hz)] Initial Guess AMP=" + currentAmpCompCalibrationVal + " ---");
+
+    // Only abort if a real, verified note reached the top rail
+    if (currentAmpCompCalibrationVal >= (uint16_t)(DIV_COUNTER * 0.98f)) {
+      Serial.println((String)"[DCO_CAL] Reached physical PWM ceiling at Note=" + ctx.currentNote);
       float highestFreqFound = find_highest_freq(ctx, j / 2);
       float lowestFreqCalc   = find_lowest_freq();
 
@@ -758,13 +836,12 @@ void calibrate_DCO(DCOCalibrationContext& ctx, double dutyErrorFraction) {
       break;
     }
 
-    const uint16_t minAmpComp = currentAmpCompCalibrationVal * 0.8;
-    const uint16_t maxAmpComp = currentAmpCompCalibrationVal * 1.3;
-    const double   freqHz     = note_to_freq(VOICE_NOTES[0]);
-    double tolerance = compute_gap_tolerance_for_freq(freqHz, dutyErrorFraction);
+    // Dynamic wide search window
+    uint16_t minAmpComp = (currentAmpCompCalibrationVal > 200) ? (currentAmpCompCalibrationVal - 200) : 1;
+    uint16_t maxAmpComp = min((uint32_t)DIV_COUNTER, (uint32_t)(currentAmpCompCalibrationVal + 300));
 
     voice_task_autotune(0, currentAmpCompCalibrationVal);
-    delay(10);
+    delay(20);
 
     uint16_t bestAmpComp = currentAmpCompCalibrationVal;
     float closestToZero = 50000.0f, previousAvgValue = 0.0f;
@@ -773,42 +850,78 @@ void calibrate_DCO(DCOCalibrationContext& ctx, double dutyErrorFraction) {
 
     for (int iteration = 0;; ++iteration) {
       if (calibrationCancelRequested) break;
-      if (iteration >= kMaxSearchIterations || (millis() - noteSearchStartMs) > kMaxNoteSearchMs) break;
+      if (iteration >= kMaxSearchIterations || (millis() - noteSearchStartMs) > kMaxNoteSearchMs) {
+        Serial.println((String)"  [TIMEOUT_GUARD] Max iterations reached. Keeping best AMP=" + bestAmpComp);
+        break;
+      }
 
       float avgValue = measure_gap_for_amp(currentAmpCompCalibrationVal);
+
       if (avgValue == kGapTimeoutSentinel) {
-        if (++consecutiveTimeouts >= kMaxConsecutiveTimeouts) break;
-        if (currentAmpCompCalibrationVal < maxAmpComp) currentAmpCompCalibrationVal += 1;
+        Serial.println((String)"  Iter " + iteration + ": AMP=" + currentAmpCompCalibrationVal + " -> TIMEOUT (No signal)");
+        if (++consecutiveTimeouts >= kMaxConsecutiveTimeouts) {
+          Serial.println((String)"  [ABORT_NOTE] " + consecutiveTimeouts + " timeouts in a row. Keeping AMP=" + bestAmpComp);
+          break;
+        }
+        // Step faster when lost in timeout territory
+        int step = (consecutiveTimeouts > 4) ? 8 : 3;
+        if (currentAmpCompCalibrationVal + step <= maxAmpComp) {
+          currentAmpCompCalibrationVal += step;
+        } else {
+          maxAmpComp = min((uint32_t)DIV_COUNTER, (uint32_t)(maxAmpComp + 200));
+          currentAmpCompCalibrationVal += step;
+        }
         continue;
       }
       consecutiveTimeouts = 0;
+
+      double dutyErrPct = duty_err_pct_from_gap(avgValue, freqHz);
+      Serial.println((String)"  Iter " + iteration + ": AMP=" + currentAmpCompCalibrationVal +
+      " -> gapUs=" + avgValue + " dutyErr=" + String(dutyErrPct, 3) + "%");
 
       if (fabsf(avgValue) < fabsf(closestToZero)) {
         closestToZero = avgValue;
         bestAmpComp = currentAmpCompCalibrationVal;
       }
 
+      // Check for zero-crossing bracket
       if ((previousAvgValue > 0.0f && avgValue < 0.0f) || (previousAvgValue < 0.0f && avgValue > 0.0f)) {
+        Serial.println("  --> Sign change crossed! Probing local neighbours...");
         for (int i = 0; i < rangeSamples; i++) {
-          uint16_t lowV = currentAmpCompCalibrationVal - (i + 1);
-          uint16_t highV = currentAmpCompCalibrationVal + (i + 1);
-          float lowM = measure_gap_for_amp(lowV);
+          uint16_t lowV  = (currentAmpCompCalibrationVal > i + 1) ? (currentAmpCompCalibrationVal - (i + 1)) : 1;
+          uint16_t highV = min((uint32_t)DIV_COUNTER, (uint32_t)(currentAmpCompCalibrationVal + (i + 1)));
+          float lowM  = measure_gap_for_amp(lowV);
           float highM = measure_gap_for_amp(highV);
-          if (fabsf(lowM) < fabsf(closestToZero))  { closestToZero = lowM; bestAmpComp = lowV; }
+          if (fabsf(lowM) < fabsf(closestToZero))  { closestToZero = lowM;  bestAmpComp = lowV; }
           if (fabsf(highM) < fabsf(closestToZero)) { closestToZero = highM; bestAmpComp = highV; }
         }
-        if (fabsf(closestToZero) <= tolerance) break;
+        if (fabsf(closestToZero) <= tolerance) {
+          Serial.println((String)"  [LOCKED] Optimal AMP=" + bestAmpComp + " (gapUs=" + closestToZero + ")");
+          break;
+        }
         tolerance *= 1.2;
         if (++flipCounter >= 3 && fabsf(closestToZero) <= tolerance * 2) break;
         tolerance *= 1.5;
       }
 
-      int magnitude = (fabsf(avgValue) < tolerance * 20) ? 1 : 2;
+      // Adaptive step size based on error magnitude
+      int magnitude = (fabsf(avgValue) < tolerance * 15) ? 1 : ((fabsf(avgValue) < tolerance * 40) ? 2 : 4);
       int32_t nextAmp = (int32_t)currentAmpCompCalibrationVal + ((avgValue > 0) ? magnitude : -magnitude);
-      if (nextAmp < (int32_t)minAmpComp) nextAmp = (int32_t)minAmpComp;
-      if (nextAmp > (int32_t)maxAmpComp) nextAmp = (int32_t)maxAmpComp;
 
-      if ((uint16_t)nextAmp == currentAmpCompCalibrationVal && (nextAmp == (int32_t)minAmpComp || nextAmp == (int32_t)maxAmpComp)) break;
+      // Auto-widen window if pushing against boundary without sign change
+      if (nextAmp > (int32_t)maxAmpComp && maxAmpComp < DIV_COUNTER) {
+        maxAmpComp = min((uint32_t)DIV_COUNTER, (uint32_t)(maxAmpComp + 250));
+      }
+      if (nextAmp < (int32_t)minAmpComp && minAmpComp > 1) {
+        minAmpComp = (minAmpComp > 150) ? (minAmpComp - 150) : 1;
+      }
+
+      nextAmp = constrain(nextAmp, (int32_t)minAmpComp, (int32_t)maxAmpComp);
+
+      if ((uint16_t)nextAmp == currentAmpCompCalibrationVal) {
+        Serial.println((String)"  [HARD_BOUND] Reached limit AMP=" + currentAmpCompCalibrationVal);
+        break;
+      }
 
       currentAmpCompCalibrationVal = (uint16_t)nextAmp;
       previousAvgValue = avgValue;
@@ -818,6 +931,9 @@ void calibrate_DCO(DCOCalibrationContext& ctx, double dutyErrorFraction) {
     ctx.calibrationData[j + 1] = bestAmpComp;
     cal_report_set_pair_from_gap(j / 2, (fabsf(closestToZero) < 40000.0f) ? closestToZero : kGapTimeoutSentinel,
                                  note_to_freq(ctx.currentNote), CAL_SRC_RUNG);
+
+    Serial.println((String)"[NOTE_RESULT] Note=" + ctx.currentNote + " Stored AMP=" + bestAmpComp +
+    " Achieved Error=" + String(duty_err_pct_from_gap(closestToZero, freqHz), 3) + "%\n");
   }
 }
 
@@ -872,15 +988,39 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   float    freqByPair[numPairs];
   uint16_t ampByPair[numPairs];
 
-  // 1. Anchor 440 Hz Probe
+  // --- 1. Anchor Diagnostic & Probe ---
   uint16_t anchorAmp = ampComp440[ctx.dcoIndex];
-  if (anchorAmp == 0) return false;
+  uint8_t  pwCh      = cal_pw_channel(ctx.dcoIndex);
 
-  float anchorFreq = find_freq_for_duty50(anchorAmp, note_to_freq(manual_cal_reference_note), kAnchorAcquireWindowRatio, true);
-  if (calibrationCancelRequested || anchorFreq <= 0.0f) return false;
+  Serial.println((String)"[FREQ_TRACE_INIT] DCO=" + ctx.dcoIndex +
+  " Recalled anchorAmp=" + anchorAmp +
+  " | PW Channel=" + pwCh + " (GP" + PW_PINS[pwCh] +
+  ") PW_CENTER=" + PW_CENTER[pwCh] +
+  " (Hardware Readback CC=" + pw_level_readback(pwCh) + ")");
+
+  if (anchorAmp == 0) {
+    Serial.println((String)"[FREQ_TRACE_GUARD] DCO=" + ctx.dcoIndex +
+    " 440 Hz anchor is 0! Run manual step 2 first.");
+    return false;
+  }
+
+  float anchorFreq = find_freq_for_duty50(
+    anchorAmp, note_to_freq(manual_cal_reference_note),
+                                          kAnchorAcquireWindowRatio, true);
+
+  if (calibrationCancelRequested || anchorFreq <= 0.0f) {
+    Serial.println((String)"[FREQ_TRACE_GUARD] DCO=" + ctx.dcoIndex +
+    " No signal at manual anchor amp=" + anchorAmp +
+    " PW_raw=" + pw_level_readback(pwCh) +
+    " (center=" + PW_CENTER[pwCh] + "); aborting.");
+    return false;
+  }
 
   add_known(anchorFreq, (float)anchorAmp);
   float anchorGapUs = g_lastFreqBisectGapUs;
+  Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
+  " Anchor acquired: AMP=" + anchorAmp + " Freq=" + fmt_freq(anchorFreq) + " Hz" +
+  freq_trace_quality(anchorGapUs, anchorFreq, g_lastFreqBisectProbes, g_lastSettleChecks));
 
   // 2. Manual Trim Point Measurement
   {

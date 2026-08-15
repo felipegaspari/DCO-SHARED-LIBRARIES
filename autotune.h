@@ -50,48 +50,49 @@ enum CalPointSource : uint8_t {
   CAL_SRC_REFINED
 };
 
-enum PWRecordMode {
-  PW_RECORD_NO_TABLE,
-  PW_RECORD_APPEND,
-  PW_RECORD_REPLACE_WORST
-};
-
-enum PWLimitDir {
-  PW_LIMIT_LOW,
-  PW_LIMIT_HIGH
-};
-
 // =============================================================================
 // Helper Data Structures
 // =============================================================================
 
 constexpr int   kCalReportPairs   = (int)(chanLevelVoiceDataSize / 2);
 constexpr float kCalDutyErrUnknown = 1e9f;
-constexpr int   kPWMaxSamples     = 40;
 
 struct FreqSearchBounds {
   float loHz;
   float hiHz;
 };
 
-struct PWSearchState {
-  uint16_t validPW[kPWMaxSamples];
-  double   validGapDiff[kPWMaxSamples];
-  int      validCount;
-  int      inToleranceCount;
-  bool     haveBest;
-  double   bestGapAbs;
-  uint16_t bestPW;
-  bool     haveBracket;
-  uint16_t pwLow, pwHigh;
-  double   gapLow;
+// =============================================================================
+// PW Calibration Types & Prototypes
+// =============================================================================
+
+enum PWLimitDir : uint8_t {
+  PW_LIMIT_LOW  = 0,
+  PW_LIMIT_HIGH = 1
 };
 
-struct PWLimitSearchResult {
-  bool     ok;
-  uint16_t limitPW;
-  double   finalDutyPercent;
+struct PWSearchResult {
+  bool     ok;           // True if search converged on a valid signal
+  uint16_t pw;           // Chosen PW PWM level
+  double   duty;         // Measured duty fraction (0.0 .. 1.0)
+  double   errorFrac;    // Deviation from target duty fraction (duty - targetDuty)
+  int      probes;       // Number of probes spent
 };
+
+// High-level PW calibration entry points
+void find_PW_center(uint8_t mode = 0);
+void find_PW_limit_v2(PWLimitDir dir);
+
+// Low-level modern search engine
+PWSearchResult find_pw_for_target_duty(
+  uint8_t  pwCh,
+  double   targetDutyFraction,
+  double   dutyToleranceFraction,
+  uint16_t pwMin,
+  uint16_t pwMax,
+  uint16_t pwSeed,
+  double   freqHz
+);
 
 // =============================================================================
 // Global State Declarations (extern)
@@ -135,6 +136,11 @@ extern float calibrationFreqHz;
 extern float gapGateFreqHz;
 extern float g_lastDrivenFreqHz;
 
+constexpr uint16_t initManualAmpCompCalibrationValPreset =
+    (uint16_t)(35u * DIV_COUNTER / 14000u);
+
+extern uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
+extern volatile uint16_t ampCompLowestFreqVal;
 extern uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
 extern volatile uint16_t ampCompLowestFreqVal;
 extern uint8_t DCO_calibration_current_note;
@@ -195,6 +201,32 @@ static inline const char* autotune_search_mode_name(uint8_t m) {
 static inline uint8_t cal_pw_channel(uint8_t osc) {
   if (NUM_PW_CHANNELS == NUM_OSCILLATORS) return osc;
   return (uint8_t)(osc / (NUM_OSCILLATORS / NUM_PW_CHANNELS));
+}
+
+// Hardware readback of the live PWM compare register for a PW channel
+static inline uint16_t pw_level_readback(uint8_t ch) {
+  if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return 0;
+  const uint32_t cc = pwm_hw->slice[PW_PWM_SLICES[ch]].cc;
+  return (pwm_gpio_to_channel(PW_PINS[ch]) == PWM_CHAN_A) ? (uint16_t)(cc & 0xFFFFu)
+  : (uint16_t)(cc >> 16);
+}
+
+// Hardware readback of the live PWM compare register for a RANGE amplitude pin
+static inline uint16_t range_level_readback(uint8_t dco) {
+  if (dco >= NUM_OSCILLATORS) return 0;
+  uint slice = pwm_gpio_to_slice_num(RANGE_PINS[dco]);
+  uint channel = pwm_gpio_to_channel(RANGE_PINS[dco]);
+  const uint32_t cc = pwm_hw->slice[slice].cc;
+  return (channel == PWM_CHAN_A) ? (uint16_t)(cc & 0xFFFFu) : (uint16_t)(cc >> 16);
+}
+
+// Universal check: returns true if oscillator 'osc' has a pulse-width comparator
+static inline bool osc_has_pw(uint8_t osc) {
+  if (NUM_PW_CHANNELS == NUM_OSCILLATORS) {
+    uint8_t ch = cal_pw_channel(osc);
+    return (ch < NUM_PW_CHANNELS && PW_PINS[ch] != PW_PIN_UNASSIGNED);
+  }
+  return ((osc % (NUM_OSCILLATORS / NUM_PW_CHANNELS)) == 0);
 }
 
 static inline uint8_t cal_stage_to_osc(uint8_t stage)    { return cal_stage_to_osc_n(stage, NUM_OSCILLATORS); }
@@ -292,8 +324,5 @@ float    quadraticInterpolation(float x0, float y0, float x1, float y1, float x2
 uint16_t logarithmicInterpolation(float x0, float y0, float x1, float y1, float x);
 float    linearInterpolation(float x0, float y0, float x1, float y1, float x);
 double   expInterpolationSolveY(double x, double x0, double x1, double y0, double y1);
-
-PWLimitSearchResult search_PW_limit_from_center(
-  uint8_t voiceIdx, uint16_t centerPW, PWLimitDir dir, double periodUs, double targetDuty);
 
 #endif  // __AUTOTUNE_H__

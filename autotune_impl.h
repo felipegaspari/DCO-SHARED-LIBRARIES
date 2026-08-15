@@ -46,11 +46,10 @@ float calibrationFreqHz = 0.0f;
 float gapGateFreqHz = 0.0f;
 float g_lastDrivenFreqHz = 0.0f;
 
-static constexpr uint16_t initManualAmpCompCalibrationValPreset = (uint16_t)(35u * DIV_COUNTER / 14000u);
 uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
 volatile uint16_t ampCompLowestFreqVal = (uint16_t)(10u * DIV_COUNTER / 14000u);
 uint8_t DCO_calibration_current_note = DCO_calibration_start_note;
-byte autotuneDebug = 1;
+byte autotuneDebug = 2;
 
 static double g_gapLogCurrentPeriodUs = 0.0;
 static double g_gapLogTargetDutyFraction = 0.5;
@@ -70,8 +69,17 @@ static inline void autotune_fill_init_manual_amp() {
 
 static inline void apply_pw_center(uint8_t ch) {
   if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return;
-  pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), PW_CENTER[ch]);
-  PW[ch] = PW_CENTER[ch];
+
+  uint16_t center = PW_CENTER[ch];
+  if (center < (DIV_COUNTER_PW / 10) || center > (DIV_COUNTER_PW * 9 / 10)) {
+    center = DIV_COUNTER_PW / 2;
+  }
+
+  pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), center);
+  PW[ch] = center;
+
+  Serial.println((String)"  [PW_HARDWARE] ch=" + ch + " GP" + PW_PINS[ch] +
+  " -> PW_CENTER=" + center + " (Readback CC=" + pw_level_readback(ch) + ")");
 }
 
 static void apply_pw_center_solo(uint8_t soloCh) {
@@ -85,40 +93,11 @@ static void apply_pw_center_solo(uint8_t soloCh) {
   }
 }
 
-static uint16_t pw_level_readback(uint8_t ch) {
-  if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return 0;
-  const uint32_t cc = pwm_hw->slice[PW_PWM_SLICES[ch]].cc;
-  return (pwm_gpio_to_channel(PW_PINS[ch]) == PWM_CHAN_A) ? (uint16_t)(cc & 0xFFFFu) : (uint16_t)(cc >> 16);
-}
-
 static void reset_pw_to_DIV_COUNTER_PW() {
   for (int i = 0; i < NUM_PW_CHANNELS; i++) {
     if (PW_PINS[i] == PW_PIN_UNASSIGNED) continue;
     pwm_set_chan_level(PW_PWM_SLICES[i], pwm_gpio_to_channel(PW_PINS[i]), DIV_COUNTER_PW);
   }
-}
-
-static void disable_all_oscillators_and_range_pwm() {
-  for (int i = 0; i < NUM_OSCILLATORS; i++) {
-    PIO     pioN = pio[VOICE_TO_PIO[i]];
-    uint8_t smN  = VOICE_TO_SM[i];
-
-    pio_sm_set_enabled(pioN, smN, true);
-    pio_sm_put(pioN, smN, 200);
-    pio_sm_exec(pioN, smN, pio_encode_pull(false, false));
-    delay(200);
-
-    pio_sm_set_enabled(pioN, smN, false);
-#ifdef RANGE0_PIO_DITHER_TEST
-    range_pio_set_level((uint8_t)i, DIV_COUNTER);
-    continue;
-#endif
-    gpio_init(RANGE_PINS[i]);
-    gpio_set_dir(RANGE_PINS[i], GPIO_OUT);
-    gpio_put(RANGE_PINS[i], 1);
-  }
-  reset_pw_to_DIV_COUNTER_PW();
-  g_lastDrivenFreqHz = 0.0f;
 }
 
 static void restore_voice_engine_after_calibration() {
@@ -129,6 +108,32 @@ static void restore_voice_engine_after_calibration() {
   for (int i = 0; i < NUM_VOICES_TOTAL; i++) {
     note_on_flag[i] = 1;
   }
+}
+
+// Helper: Cleanly mute oscillators and keep state machines running so the
+// internal DCO core capacitors and RANGE RC filters can naturally drain to 0V.
+static void disable_all_oscillators_and_range_pwm() {
+  // 1. Keep state machines running in sync
+  start_voice_sms();
+
+  // 2. Mute all RANGE amplitudes cleanly.
+  // The PIO keeps cycling, which naturally drains the analog RC filters to 0V
+  // WITHOUT altering the synth's internal polyphonic voice routing.
+  for (int i = 0; i < NUM_OSCILLATORS; i++) {
+    #ifndef RANGE0_PIO_DITHER_TEST
+    gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
+    #endif
+    write_range_pwm(i, 0); // Mute voltage
+  }
+
+  // 3. Mute all PW channels (0% duty / 0V)
+  for (int ch = 0; ch < NUM_PW_CHANNELS; ch++) {
+    if (PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
+    pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
+    PW[ch] = 0;
+  }
+
+  g_lastDrivenFreqHz = 0.0f;
 }
 
 void restart_DCO_calibration() {
@@ -143,19 +148,67 @@ void restart_DCO_calibration() {
   calibrationData[3] = initManualAmpCompCalibrationVal[currentDCO] + manualCalibrationOffset[currentDCO];
 
   DCOCalibrationStart = millis();
-  disable_all_oscillators_and_range_pwm();
 
-#ifndef RANGE0_PIO_DITHER_TEST
-  gpio_set_function(RANGE_PINS[currentDCO], GPIO_FUNC_PWM);
-#endif
+  // 1. Ensure inactive oscillators stay muted
+  for (int i = 0; i < NUM_OSCILLATORS; i++) {
+    if (i != currentDCO) {
+      write_range_pwm(i, 0);
+    }
+  }
 
-  PIO pioN = pio[VOICE_TO_PIO[currentDCO]];
-  uint8_t sm1N = VOICE_TO_SM[currentDCO];
-  pio_sm_set_enabled(pioN, sm1N, true);
+  // 2. CONFIGURE PW FOR ACTIVE OSCILLATOR ONLY
+  const uint8_t pwCh = cal_pw_channel(currentDCO);
+  const bool hasPW   = osc_has_pw(currentDCO);
 
-  apply_pw_center_solo(cal_pw_channel(currentDCO));
+  if (hasPW) {
+    uint16_t center = PW_CENTER[pwCh];
+    // Sanity check: ensure center is a valid square wave
+    if (center < 100 || center > DIV_COUNTER_PW - 100) center = DIV_COUNTER_PW / 2;
+
+    for (int ch = 0; ch < NUM_PW_CHANNELS; ch++) {
+      if (PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
+      if (ch == pwCh) {
+        pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), center);
+        PW[ch] = center;
+      } else {
+        pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
+        PW[ch] = 0;
+      }
+    }
+  } else {
+    // Mute all PW channels for odd/fixed-wave oscillators
+    for (int ch = 0; ch < NUM_PW_CHANNELS; ch++) {
+      if (PW_PINS[ch] != PW_PIN_UNASSIGNED) {
+        pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
+        PW[ch] = 0;
+      }
+    }
+  }
+
+  // 3. APPLY STARTING AMPLITUDE & PITCH TO ACTIVE OSCILLATOR
+  ampCompCalibrationVal = initManualAmpCompCalibrationVal[currentDCO] + manualCalibrationOffset[currentDCO];
+  write_range_pwm(currentDCO, ampCompCalibrationVal);
+
+  // Kickstart frequency exactly how Manual Calibration does it
+  voice_task_autotune(0, ampCompCalibrationVal);
+
+  // 4. Print Hardware Diagnostics
+  Serial.println((String)"\n--- [HARDWARE STATE DCO " + currentDCO + "] ---");
+  Serial.println((String)"  PIO: " + VOICE_TO_PIO[currentDCO] + " | SM: " + VOICE_TO_SM[currentDCO]);
+  Serial.println((String)"  RANGE Pin: GP" + RANGE_PINS[currentDCO] + " | AMP=" + ampCompCalibrationVal +
+  " (HW RangeCC=" + range_level_readback(currentDCO) + ")");
+  if (hasPW) {
+    Serial.println((String)"  PW Channel: " + pwCh + " (GP" + PW_PINS[pwCh] + ") | PW_CENTER=" + PW_CENTER[pwCh] +
+    " (HW PW_CC=" + pw_level_readback(pwCh) + ")");
+  } else {
+    Serial.println((String)"  PW Channel: None / Muted (HW PW_CC=" + pw_level_readback(pwCh) + ")");
+  }
+  Serial.println("--------------------------------------------------");
+
   g_lastDrivenFreqHz = 0.0f;
-  delay(100);
+
+  // Give the active DCO's analog circuit a moment to rise to its starting baseline
+  delay(150);
 }
 
 // =============================================================================
@@ -213,6 +266,8 @@ float find_gap(uint8_t specialMode) {
   bool     lastVal          = 0;
   uint16_t risingCount      = 0;
   uint16_t fallingCount     = 0;
+  uint16_t edgesSeen        = 0;
+  uint16_t edgesRejected    = 0;
 
   unsigned long lastEdgeTime   = micros();
   uint32_t      lastEdgeCycles = rp2040.getCycleCount();
@@ -227,7 +282,17 @@ float find_gap(uint8_t specialMode) {
     const uint32_t      nowCycles = rp2040.getCycleCount();
     const unsigned long nowUs     = micros();
 
-    if ((nowUs - lastEdgeTime) > timeoutUs) return kGapTimeoutSentinel;
+    if ((nowUs - lastEdgeTime) > timeoutUs) {
+      if (autotuneDebug >= 1) {
+        Serial.println((String)"  [GAP_TIMEOUT] DCO=" + currentDCO + " Mode=" + specialMode +
+        " Note=" + DCO_calibration_current_note + " Freq=" + fmt_freq((float)freqHz) + "Hz" +
+        " AMP=" + ampCompCalibrationVal + " (RangeCC=" + range_level_readback(currentDCO) +
+        " PW_CC=" + pw_level_readback(cal_pw_channel(currentDCO)) + ")" +
+        " EdgesSeen=" + edgesSeen + " Rej=" + edgesRejected + " Accepted=" + acceptedSamples + "/" + samplesTarget +
+        " TimeoutUs=" + timeoutUs + " RawPin=" + (int)rawVal);
+      }
+      return kGapTimeoutSentinel;
+    }
 
     if (val != lastVal) {
       const uint32_t fine24     = (nowCycles - lastEdgeCycles) & 0x00FFFFFFu;
@@ -237,6 +302,7 @@ float find_gap(uint8_t specialMode) {
 
       if (dtCycles >= debounceCycles) {
         lastVal = val;
+        edgesSeen++;
         if (pulseCount == 1 && val == 0) pulseCount = 0;
 
         if (pulseCount > 2) {
@@ -250,6 +316,8 @@ float find_gap(uint8_t specialMode) {
               risingCount++;
             }
             acceptedSamples++;
+          } else {
+            edgesRejected++;
           }
         }
         lastEdgeTime   = nowUs;
@@ -259,383 +327,345 @@ float find_gap(uint8_t specialMode) {
     }
   }
 
-  if (specialMode == 3 && (risingCount == 0 || fallingCount == 0)) return kGapTimeoutSentinel;
+  if (specialMode == 3 && (risingCount == 0 || fallingCount == 0)) {
+    if (autotuneDebug >= 2) {
+      Serial.println((String)"  [GAP_ONESIDED] DCO=" + currentDCO + " Highs=" + risingCount + " Lows=" + fallingCount + " (Rail Pegged)");
+    }
+    return kGapTimeoutSentinel;
+  }
 
   float avgLowUs  = (fallingCount > 0) ? (float)((double)fallingSumCycles * usPerCycle / (double)fallingCount) : 0.0f;
   float avgHighUs = (risingCount > 0)  ? (float)((double)risingSumCycles * usPerCycle / (double)risingCount)  : 0.0f;
   float measuredPeriodUs = avgLowUs + avgHighUs;
+  float diffUs = avgHighUs - avgLowUs;
 
   if (specialMode == 3 && idealPeriodUs > 0.0 && fabsf(measuredPeriodUs - (float)idealPeriodUs) > kGapPeriodTolRatio * (float)idealPeriodUs) {
+    if (autotuneDebug >= 2) {
+      Serial.println((String)"  [GAP_OFFPERIOD] DCO=" + currentDCO + " T_meas=" + measuredPeriodUs + "us T_ideal=" + (float)idealPeriodUs + "us");
+    }
     return kGapTimeoutSentinel;
   }
 
-  return avgHighUs - avgLowUs;
+  if (autotuneDebug >= 2) {
+    double dutyIdealPct = (idealPeriodUs > 0.0) ? (0.5 + (double)diffUs / (2.0 * idealPeriodUs)) * 100.0 : 0.0;
+    Serial.println((String)"    [GAP_MEASURE] Mode=" + specialMode + " DCO=" + currentDCO +
+    " Freq=" + fmt_freq((float)freqHz) + "Hz AMP=" + ampCompCalibrationVal +
+    " PW=" + pw_level_readback(cal_pw_channel(currentDCO)) +
+    " DiffUs=" + diffUs + " Duty≈" + String(dutyIdealPct, 2) + "%");
+  }
+
+  return diffUs;
 }
 
 // =============================================================================
 // Pulse-Width (PW) Calibration Subsystem
 // =============================================================================
+// =============================================================================
+// Modern Pulse-Width (PW) Calibration Engine
+// =============================================================================
 
+// Helper: Program PW hardware and measure the raw edge gap (used by diagnostics & probes)
 static GapMeasurement set_pw_and_measure(uint8_t pwCh, uint16_t pw) {
+  if (pwCh >= NUM_PW_CHANNELS || PW_PINS[pwCh] == PW_PIN_UNASSIGNED) {
+    return { true, kGapTimeoutSentinel };
+  }
   pwm_set_chan_level(PW_PWM_SLICES[pwCh], pwm_gpio_to_channel(PW_PINS[pwCh]), pw);
   PW[pwCh] = pw;
   delay(30);
   return measure_gap(2);
 }
 
-static void pw_search_state_init(PWSearchState& st) {
-  st.validCount = 0; st.inToleranceCount = 0; st.haveBest = false;
-  st.bestGapAbs = 1e12; st.bestPW = 0; st.haveBracket = false;
-  st.pwLow = 0; st.pwHigh = 0; st.gapLow = 0.0;
+// Helper: Program PW hardware, wait for analog settle, and return measured duty (0.0..1.0).
+// Returns -1.0 on timeout / collapsed pulse.
+static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
+  if (pwCh >= NUM_PW_CHANNELS || PW_PINS[pwCh] == PW_PIN_UNASSIGNED) return -1.0;
+
+  pwm_set_chan_level(PW_PWM_SLICES[pwCh], pwm_gpio_to_channel(PW_PINS[pwCh]), pw);
+  PW[pwCh] = pw;
+
+  const CalPrecisionProfile &prec = cal_precision();
+  wait_periods((float)freqHz, prec.settlePeriods, prec.settleMinMs * 1000u);
+
+  ++calRunProbes;
+  GapMeasurement gm = measure_gap(2);
+  if (gm.timedOut || freqHz <= 0.0) {
+    if (autotuneDebug >= 2) {
+      Serial.println((String)"  [PW_PROBE] Ch=" + pwCh + " PW=" + pw + " -> TIMEOUT (Pulse Collapsed)");
+    }
+    return -1.0;
+  }
+
+  double periodUs = 1000000.0 / freqHz;
+  double duty = 0.5 + ((double)gm.value / (2.0 * periodUs));
+  if (duty < 0.0) duty = 0.0;
+  if (duty > 1.0) duty = 1.0;
+
+  if (autotuneDebug >= 2) {
+    Serial.println((String)"  [PW_PROBE] Ch=" + pwCh + " PW=" + pw +
+    " -> GapUs=" + gm.value + " Duty=" + String(duty * 100.0, 2) + "%");
+  }
+  return duty;
 }
 
-static void pw_record_sample(PWSearchState& st, uint16_t pw, double gapDiff, double targetGap, PWRecordMode mode) {
-  double absGapDiff = fabs(gapDiff);
-  if (absGapDiff <= targetGap) st.inToleranceCount++;
-  if (!st.haveBest || absGapDiff < st.bestGapAbs) {
-    st.haveBest   = true;
-    st.bestGapAbs = absGapDiff;
-    st.bestPW     = pw;
+// Low-level unified PW root-finder using Illinois Secant bisection
+PWSearchResult find_pw_for_target_duty(
+  uint8_t  pwCh,
+  double   targetDutyFraction,
+  double   dutyToleranceFraction,
+  uint16_t pwMin,
+  uint16_t pwMax,
+  uint16_t pwSeed,
+  double   freqHz
+) {
+  PWSearchResult res = { false, pwSeed, -1.0, 1.0, 0 };
+  if (pwCh >= NUM_PW_CHANNELS || PW_PINS[pwCh] == PW_PIN_UNASSIGNED || freqHz <= 0.0) {
+    return res;
   }
-  if (mode == PW_RECORD_NO_TABLE) return;
 
-  if (st.validCount < kPWMaxSamples) {
-    st.validPW[st.validCount]      = pw;
-    st.validGapDiff[st.validCount] = gapDiff;
-    st.validCount++;
-  } else if (mode == PW_RECORD_REPLACE_WORST) {
-    int worstIdx = 0;
-    double worstAbs = fabs(st.validGapDiff[0]);
-    for (int vi = 1; vi < st.validCount; ++vi) {
-      double curAbs = fabs(st.validGapDiff[vi]);
-      if (curAbs > worstAbs) { worstAbs = curAbs; worstIdx = vi; }
-    }
-    if (absGapDiff < worstAbs) {
-      st.validPW[worstIdx]      = pw;
-      st.validGapDiff[worstIdx] = gapDiff;
-    }
-  }
-}
+  const CalPrecisionProfile &prec = cal_precision();
+  const int maxProbes = prec.bisectIters;
 
-static void pw_coarse_scan(PWSearchState& st, double gapTarget, double targetGap, uint16_t pwMin, uint16_t pwMax,
-                           uint16_t coarseStep, double periodUs, double toleranceDutyPercent) {
-  bool     havePrev = false;
-  double   prevGapDiff = 0.0;
-  uint16_t prevPW = 0;
+  // Bracket tracking: [pwLo, pwHi]
+  double pwLo = -1.0, pwHi = -1.0;
+  double errLo = 0.0, errHi = 0.0;
 
-  for (uint16_t pw = pwMin; pw <= pwMax; pw = (uint16_t)(pw + coarseStep)) {
-    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 60000)) break;
+  uint16_t bestPW     = pwSeed;
+  double   bestDuty   = -1.0;
+  double   bestAbsErr = 1e9;
 
-    GapMeasurement gm = set_pw_and_measure(cal_pw_channel(currentDCO), pw);
-    if (gm.timedOut) continue;
+  double   curPW = (double)constrain(pwSeed, pwMin, pwMax);
+  uint16_t step  = max(1, (int)((pwMax - pwMin) / 16));
+  int      lastSide = 0;
 
-    double gapDiff = (double)gm.value - gapTarget;
-    pw_record_sample(st, pw, gapDiff, targetGap, PW_RECORD_REPLACE_WORST);
+  for (int probe = 0; probe < maxProbes; ++probe) {
+    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 60000UL)) break;
 
-    if (havePrev && ((gapDiff > 0.0 && prevGapDiff < 0.0) || (gapDiff < 0.0 && prevGapDiff > 0.0))) {
-      st.haveBracket = true;
-      st.pwLow  = prevPW;
-      st.gapLow = prevGapDiff + gapTarget;
-      st.pwHigh = pw;
+    uint16_t testPW = (uint16_t)lround(curPW);
+    testPW = constrain(testPW, pwMin, pwMax);
 
-      double denom = fabs(prevGapDiff) + fabs(gapDiff);
-      if (denom > 0.0) {
-        double t = fabs(prevGapDiff) / denom;
-        uint16_t pwEst = (uint16_t)((double)prevPW + ((double)(pw - prevPW) * t));
-        if (pwEst >= pwMin && pwEst <= pwMax) {
-          GapMeasurement gmEst = set_pw_and_measure(cal_pw_channel(currentDCO), pwEst);
-          if (!gmEst.timedOut) {
-            pw_record_sample(st, pwEst, (double)gmEst.value - gapTarget, targetGap, PW_RECORD_APPEND);
-          }
-        }
+    double duty = measure_pw_duty(pwCh, testPW, freqHz);
+    res.probes++;
+
+    if (duty < 0.0) {
+      // Pulse collapsed at this extreme; back off toward center
+      if (curPW > (pwMin + pwMax) / 2.0) {
+        curPW -= step;
+      } else {
+        curPW += step;
       }
-      break;
+      step = max(1, step / 2);
+      continue;
     }
-    havePrev = true; prevGapDiff = gapDiff; prevPW = pw;
-  }
-}
 
-static void pw_bisect_bracket(PWSearchState& st, double gapTarget, double targetGap, double periodUs, double toleranceDutyPercent) {
-  uint16_t pwLow  = st.pwLow, pwHigh = st.pwHigh;
-  double   gapLow = st.gapLow;
+    double err = duty - targetDutyFraction; // Signed error
+    double absErr = fabs(err);
 
-  for (int iter = 0; iter < 14; ++iter) {
-    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 60000)) break;
+    if (absErr < bestAbsErr) {
+      bestAbsErr = absErr;
+      bestPW     = testPW;
+      bestDuty   = duty;
+    }
 
-    uint16_t pwMid = (uint16_t)((pwLow + pwHigh) / 2);
-    GapMeasurement gm = set_pw_and_measure(cal_pw_channel(currentDCO), pwMid);
-    if (gm.timedOut) continue;
+    if (autotuneDebug >= 2) {
+      Serial.println((String)"[PW_SEARCH] ch=" + pwCh + " PW=" + testPW +
+                     " duty=" + String(duty * 100.0, 2) + "% target=" +
+                     String(targetDutyFraction * 100.0, 1) + "% err=" +
+                     String(err * 100.0, 3) + "% tol=±" +
+                     String(dutyToleranceFraction * 100.0, 2) + "%");
+    }
 
-    double gapMid = (double)gm.value;
-    double gapDiffMid = gapMid - gapTarget;
-    pw_record_sample(st, pwMid, gapDiffMid, targetGap, PW_RECORD_NO_TABLE);
+    if (absErr <= dutyToleranceFraction) {
+      break; // Converged within target tolerance
+    }
 
-    if ((gapDiffMid > 0.0 && (gapLow - gapTarget) > 0.0) || (gapDiffMid < 0.0 && (gapLow - gapTarget) < 0.0)) {
-      pwLow  = pwMid; gapLow = gapMid;
+    // Bracket formation & Illinois Secant step
+    int side = (err > 0.0) ? 1 : -1;
+
+    if (side > 0) {
+      pwHi = (double)testPW; errHi = err;
     } else {
-      pwHigh = pwMid;
+      pwLo = (double)testPW; errLo = err;
     }
-    if (pwHigh - pwLow <= 1) break;
-  }
-}
 
-static void pw_fine_scan_around_best(PWSearchState& st, double gapTarget, double targetGap, uint16_t pwMin, uint16_t pwMax, uint16_t coarseStep) {
-  uint16_t startPW = (st.haveBest && st.bestPW >= pwMin && st.bestPW <= pwMax) ? st.bestPW : (uint16_t)((pwMin + pwMax) / 2);
-  uint16_t span = (coarseStep > 0) ? coarseStep * 2 : 4;
-  uint16_t fineMin = (startPW > span) ? (startPW - span) : pwMin;
-  uint16_t fineMax = (startPW + span < pwMax) ? (startPW + span) : pwMax;
-  uint16_t fineStep = (fineMax > fineMin) ? ((fineMax - fineMin) / 16) : 1;
-  if (fineStep == 0) fineStep = 1;
+    if (side == lastSide) {
+      if (side > 0 && pwLo >= 0.0) errLo *= 0.5; // Illinois damping
+      if (side < 0 && pwHi >= 0.0) errHi *= 0.5;
+    }
+    lastSide = side;
 
-  for (uint16_t pw = fineMin; pw <= fineMax; pw = (uint16_t)(pw + fineStep)) {
-    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 60000)) break;
-    GapMeasurement gm = set_pw_and_measure(cal_pw_channel(currentDCO), pw);
-    if (gm.timedOut) continue;
-    pw_record_sample(st, pw, (double)gm.value - gapTarget, targetGap, PW_RECORD_APPEND);
-  }
-}
+    if (pwLo >= 0.0 && pwHi >= 0.0) {
+      if (fabs(pwHi - pwLo) <= 1.0) break; // Exhausted integer resolution
 
-static bool pw_lock_in(uint8_t voiceIdx, uint16_t pw, double gapTarget, double targetGap, double periodUs, double& lockedGapOut) {
-  int consecutiveOk = 0;
-  for (int li = 0; li < 8; ++li) {
-    if (calibrationCancelRequested) return false;
-    GapMeasurement gm = set_pw_and_measure(voiceIdx, pw);
-    if (gm.timedOut || periodUs <= 0.0) { consecutiveOk = 0; continue; }
+      double denom = errHi - errLo;
+      double nextPW = (fabs(denom) > 1e-6)
+                        ? (pwLo - errLo * (pwHi - pwLo) / denom)
+                        : (0.5 * (pwLo + pwHi));
 
-    double gap = (double)gm.value;
-    if (fabs(gap - gapTarget) <= targetGap) {
-      if (++consecutiveOk >= 3) { lockedGapOut = gap; return true; }
+      double guard = 0.1 * (pwHi - pwLo);
+      if (nextPW < pwLo + guard) nextPW = pwLo + guard;
+      if (nextPW > pwHi - guard) nextPW = pwHi - guard;
+
+      curPW = nextPW;
     } else {
-      consecutiveOk = 0;
+      // Step outward linearly based on expected slope
+      double deltaPW = -err * (double)(pwMax - pwMin);
+      if (fabs(deltaPW) < (double)step) deltaPW = (err > 0) ? -step : step;
+      curPW += deltaPW;
+      curPW = constrain(curPW, (double)pwMin, (double)pwMax);
+      step = max(1, step / 2);
     }
   }
-  return false;
-}
 
-static bool pw_select_and_lock(PWSearchState& st, double gapTarget, double targetGap, uint16_t pwMin, uint16_t pwMax,
-                               double periodUs, uint16_t& chosenPWOut) {
-  for (int attempt = 0; attempt < st.validCount; ++attempt) {
-    if (calibrationCancelRequested) return false;
-    int bestIdx = -1;
-    double bestAbs = 1e12;
+  // Confirmation Averaging Phase
+  if (bestDuty >= 0.0) {
+    int confirmReads = max(1, (int)prec.confirmReads);
+    double sumDuty = 0.0;
+    int validReads = 0;
 
-    for (int vi = 0; vi < st.validCount; ++vi) {
-      double curAbs = fabs(st.validGapDiff[vi]);
-      if (curAbs < bestAbs) { bestAbs = curAbs; bestIdx = vi; }
-    }
-    if (bestIdx < 0 || bestAbs > targetGap * 10.0) return false;
-
-    uint16_t chosenPW = st.validPW[bestIdx];
-    double   lockedGap = 0.0;
-
-    if (pw_lock_in(cal_pw_channel(currentDCO), chosenPW, gapTarget, targetGap, periodUs, lockedGap)) {
-      uint16_t bestLocalPW     = chosenPW;
-      double   bestLocalGapAbs = bestAbs;
-
-      for (int16_t off = -2; off <= 2; ++off) {
-        int32_t testPW32 = (int32_t)chosenPW + off;
-        if (testPW32 < (int32_t)pwMin || testPW32 > (int32_t)pwMax) continue;
-        uint16_t testPW = (uint16_t)testPW32;
-        double gapLocal = 0.0;
-        if (pw_lock_in(cal_pw_channel(currentDCO), testPW, gapTarget, targetGap, periodUs, gapLocal)) {
-          double absDiff = fabs(gapLocal - gapTarget);
-          if (absDiff < bestLocalGapAbs) {
-            bestLocalGapAbs = absDiff;
-            bestLocalPW     = testPW;
-          }
-        }
+    for (int r = 0; r < confirmReads; ++r) {
+      double d = measure_pw_duty(pwCh, bestPW, freqHz);
+      if (d >= 0.0) {
+        sumDuty += d;
+        validReads++;
       }
-      chosenPWOut = bestLocalPW;
-      return true;
     }
-    st.validGapDiff[bestIdx] = targetGap * 20.0;
+
+    if (validReads > 0) {
+      bestDuty = sumDuty / (double)validReads;
+      bestAbsErr = fabs(bestDuty - targetDutyFraction);
+    }
+
+    res.ok        = true;
+    res.pw        = bestPW;
+    res.duty      = bestDuty;
+    res.errorFrac = bestDuty - targetDutyFraction;
   }
-  return false;
+
+  return res;
 }
 
-static uint16_t find_PW_for_target_duty(double targetDutyFraction, uint16_t targetGap, uint16_t pwMin, uint16_t pwMax, uint16_t fallbackPW) {
-  double freqHz   = (double)note_to_freq(DCO_calibration_current_note);
-  double periodUs = (freqHz > 0.0) ? (1000000.0 / freqHz) : 0.0;
-
-  g_gapLogCurrentPeriodUs    = periodUs;
-  g_gapLogTargetDutyFraction = targetDutyFraction;
-
-  double toleranceDutyPercent = 0.0, gapTarget = 0.0;
-  if (periodUs > 0.0) {
-    gapTarget = periodUs * (2.0 * targetDutyFraction - 1.0);
-    toleranceDutyPercent = ((double)targetGap / (2.0 * periodUs)) * 100.0;
-  }
-
-  uint16_t coarseDiv  = (fabs(targetDutyFraction - 0.5) < 0.05) ? 16 : 32;
-  uint16_t coarseStep = (pwMax > pwMin) ? ((pwMax - pwMin) / coarseDiv) : 1;
-  if (coarseStep == 0) coarseStep = 1;
-
-  PWSearchState st;
-  pw_search_state_init(st);
-
-  pw_coarse_scan(st, gapTarget, (double)targetGap, pwMin, pwMax, coarseStep, periodUs, toleranceDutyPercent);
-  if (st.haveBracket) {
-    pw_bisect_bracket(st, gapTarget, (double)targetGap, periodUs, toleranceDutyPercent);
-  } else {
-    pw_fine_scan_around_best(st, gapTarget, (double)targetGap, pwMin, pwMax, coarseStep);
-  }
-
-  if (calibrationCancelRequested || st.validCount == 0) return fallbackPW;
-
-  uint16_t chosenPW = fallbackPW;
-  if (pw_select_and_lock(st, gapTarget, (double)targetGap, pwMin, pwMax, periodUs, chosenPW)) {
-    return chosenPW;
-  }
-  return fallbackPW;
-}
-
+// High-level PW Center Search
 void find_PW_center(uint8_t mode) {
-  DCO_calibration_current_note = manual_DCO_calibration_start_note;
-  VOICE_NOTES[0] = DCO_calibration_current_note;
-  ampCompCalibrationVal = initManualAmpCompCalibrationVal[currentDCO] + manualCalibrationOffset[currentDCO];
+  // Use 440 Hz anchor instead of 16 Hz for massive speedup!
+  uint8_t note = manual_cal_reference_note;
+  DCO_calibration_current_note = note;
+  VOICE_NOTES[0] = note;
 
-  uint16_t targetGap;
-  uint8_t voiceTaskMode;
-
-  if (mode == 0) {
-    targetGap = compute_gap_tolerance_for_freq(note_to_freq(DCO_calibration_current_note), 0.005);
-    voiceTaskMode = 2;
-  } else {
-    DCO_calibration_current_note = 76;
-    VOICE_NOTES[0] = DCO_calibration_current_note;
-    targetGap = 5;
-    voiceTaskMode = 3;
-  }
-
-  DCOCalibrationStart = millis();
   const uint8_t pwCh = cal_pw_channel(currentDCO);
   if (PW_PINS[pwCh] == PW_PIN_UNASSIGNED) return;
 
-  uint16_t startPW = (firstTuneFlag == true) ? (DIV_COUNTER_PW / 2) : PW_CENTER[pwCh];
-  PW[pwCh] = startPW;
-
-  pwm_set_chan_level(PW_PWM_SLICES[pwCh], pwm_gpio_to_channel(PW_PINS[pwCh]), startPW);
-  voice_task_autotune(voiceTaskMode, ampCompCalibrationVal);
-
-  uint16_t centerPW = find_PW_for_target_duty(kPWCenterDutyFraction, targetGap, 0, DIV_COUNTER_PW, startPW);
-  if (calibrationCancelRequested) return;
-
-  update_FS_PWCenter(pwCh, centerPW);
-  PW_CENTER[pwCh] = centerPW;
-  apply_pw_center(pwCh);
-}
-
-PWLimitSearchResult search_PW_limit_from_center(uint8_t voiceIdx, uint16_t centerPW, PWLimitDir dir, double periodUs, double targetDuty) {
-  PWLimitSearchResult result = { false, centerPW, -1.0 };
-  if (periodUs <= 0.0) return result;
-
-  uint16_t minPW = (dir == PW_LIMIT_LOW) ? 0 : centerPW;
-  uint16_t maxPW = (dir == PW_LIMIT_LOW) ? centerPW : DIV_COUNTER_PW;
-  uint16_t step  = DIV_COUNTER_PW / 64;
-  if (step == 0) step = 1;
-
-  bool     haveBest = false;
-  uint16_t bestPW   = centerPW;
-  double   bestDelta = 1e12, bestDuty = -1.0;
-  unsigned long searchStartMs = millis();
-
-  for (uint16_t pw = centerPW; ; ) {
-    if (calibrationCancelRequested || (millis() - searchStartMs > 60000UL)) break;
-    if (pw < minPW) pw = minPW;
-    if (pw > maxPW) pw = maxPW;
-
-    GapMeasurement gm = set_pw_and_measure(voiceIdx, pw);
-    if (!gm.timedOut) {
-      double duty  = 0.5 + ((double)gm.value / (2.0 * periodUs));
-      double delta = fabs(duty - targetDuty);
-      if (!haveBest || delta < bestDelta) {
-        haveBest = true; bestDelta = delta; bestPW = pw; bestDuty = duty;
-      }
-      if (delta <= kPWLimitDutyTolerance) break;
-    }
-
-    if (dir == PW_LIMIT_LOW) {
-      if (pw <= minPW + step) break;
-      pw = (uint16_t)(pw - step);
-    } else {
-      if (pw >= maxPW - step) break;
-      pw = (uint16_t)(pw + step);
-    }
-  }
-
-  if (!haveBest) return result;
-
-  uint16_t refineRadius = step / 2;
-  if (refineRadius < 4)  refineRadius = 4;
-  if (refineRadius > 32) refineRadius = 32;
-
-  uint16_t startPW = (bestPW > refineRadius) ? (bestPW - refineRadius) : minPW;
-  if (startPW < minPW) startPW = minPW;
-  uint16_t endPW = bestPW + refineRadius;
-  if (endPW > maxPW) endPW = maxPW;
-
-  int consecutiveTimeouts = 0;
-  for (uint16_t pw = startPW; pw <= endPW; ++pw) {
-    if (calibrationCancelRequested) break;
-    GapMeasurement gm = set_pw_and_measure(voiceIdx, pw);
-    if (gm.timedOut) {
-      if (++consecutiveTimeouts >= 4) break;
-      continue;
-    }
-    consecutiveTimeouts = 0;
-    double duty  = 0.5 + ((double)gm.value / (2.0 * periodUs));
-    double delta = fabs(duty - targetDuty);
-    if (delta < bestDelta) {
-      bestDelta = delta; bestPW = pw; bestDuty = duty;
-    }
-  }
-
-  result.ok = true;
-  result.limitPW = bestPW;
-  if (bestDuty >= 0.0) result.finalDutyPercent = bestDuty * 100.0;
-
-  double currentDutyFrac = result.finalDutyPercent / 100.0;
-  if (result.finalDutyPercent <= 0.0 || fabs(currentDutyFrac - targetDuty) > kPWLimitDutyTolerance) {
-    uint16_t boundaryPW = (dir == PW_LIMIT_LOW) ? minPW : maxPW;
-    GapMeasurement gmEdge = set_pw_and_measure(voiceIdx, boundaryPW);
-    if (!gmEdge.timedOut) {
-      result.limitPW        = boundaryPW;
-      result.finalDutyPercent = (0.5 + ((double)gmEdge.value / (2.0 * periodUs))) * 100.0;
-    } else {
-      result.limitPW = boundaryPW;
-    }
-  }
-  return result;
-}
-
-void find_PW_limit_v2(PWLimitDir dir) {
-  DCO_calibration_current_note = manual_DCO_calibration_start_note;
-  VOICE_NOTES[0] = DCO_calibration_current_note;
-  ampCompCalibrationVal = initManualAmpCompCalibrationVal[currentDCO] + manualCalibrationOffset[currentDCO];
   DCOCalibrationStart = millis();
 
-  double freqHz   = (double)note_to_freq(DCO_calibration_current_note);
-  double periodUs = (freqHz > 0.0) ? (1000000.0 / freqHz) : 0.0;
-  uint8_t voiceIdx = cal_pw_channel(currentDCO);
-  uint16_t centerPW = PW_CENTER[voiceIdx];
-  double targetDuty = (dir == PW_LIMIT_LOW) ? kPWLowDutyFraction : kPWHighDutyFraction;
-
-  g_gapLogCurrentPeriodUs    = periodUs;
-  g_gapLogTargetDutyFraction = targetDuty;
-
-  voice_task_autotune(2, ampCompCalibrationVal);
-  delay(100);
-
-  PWLimitSearchResult res = search_PW_limit_from_center(voiceIdx, centerPW, dir, periodUs, targetDuty);
-  if (calibrationCancelRequested || !res.ok) return;
-
-  if (dir == PW_LIMIT_LOW) {
-    update_FS_PW_Low_Limit(voiceIdx, res.limitPW);
-    PW_LOW_LIMIT[voiceIdx] = res.limitPW;
-  } else {
-    update_FS_PW_High_Limit(voiceIdx, res.limitPW);
-    PW_HIGH_LIMIT[voiceIdx] = res.limitPW;
+  // Retrieve the strong 440 Hz amplitude (with fallback for fresh EEPROM/Flash)
+  uint16_t amp = ampComp440[currentDCO];
+  if (amp < 500) {
+    amp = (uint16_t)(DIV_COUNTER / 4); // Safe fallback (~3500)
   }
+  ampCompCalibrationVal = amp;
+
+  // Force the hardware to the new 440Hz frequency and amplitude
+  write_range_pwm(currentDCO, amp);
+  voice_task_autotune((mode == 0) ? 2 : 3, amp);
+
+  double freqHz   = (double)note_to_freq(note);
+  uint16_t startPW = (firstTuneFlag) ? (DIV_COUNTER_PW / 2) : PW_CENTER[pwCh];
+  double dutyTol  = (mode == 0) ? 0.003 : 0.005; // ±0.3% low note, ±0.5% high note
+
+  Serial.println((String)"[PW_CENTER_START] DCO=" + currentDCO + " ch=" + pwCh +
+  " note=" + note + " freq=" + fmt_freq((float)freqHz) +
+  " anchorAmp=" + amp + " seed=" + startPW);
+
+  PWSearchResult res = find_pw_for_target_duty(
+    pwCh,
+    kPWCenterDutyFraction,
+    dutyTol,
+    0,
+    DIV_COUNTER_PW,
+    startPW,
+    freqHz
+  );
+
+  if (calibrationCancelRequested) return;
+
+  if (res.ok) {
+    PW_CENTER[pwCh] = res.pw;
+    update_FS_PWCenter(pwCh, res.pw);
+    apply_pw_center(pwCh);
+
+    Serial.println((String)"[PW_CENTER_RESULT] ch=" + pwCh + " PW_CENTER=" + res.pw +
+    " duty=" + String(res.duty * 100.0, 2) + "% err=" +
+    String(res.errorFrac * 100.0, 3) + "% (" + res.probes + " probes)");
+  } else {
+    Serial.println((String)"[PW_CENTER_FAIL] ch=" + pwCh + " keeping previous=" + PW_CENTER[pwCh]);
+  }
+}
+
+// High-level PW Low/High Limit Search
+void find_PW_limit_v2(PWLimitDir dir) {
+  // Use 440 Hz anchor for high-speed limit detection
+  uint8_t note = manual_cal_reference_note;
+  DCO_calibration_current_note = note;
+  VOICE_NOTES[0] = note;
+
+  const uint8_t pwCh = cal_pw_channel(currentDCO);
+  if (PW_PINS[pwCh] == PW_PIN_UNASSIGNED) return;
+
+  DCOCalibrationStart = millis();
+
+  // Retrieve the strong 440 Hz amplitude
+  uint16_t amp = ampComp440[currentDCO];
+  if (amp < 500) {
+    amp = (uint16_t)(DIV_COUNTER / 4);
+  }
+  ampCompCalibrationVal = amp;
+
+  // Force the hardware to the new 440Hz frequency and amplitude
+  write_range_pwm(currentDCO, amp);
+  voice_task_autotune(2, amp);
+
+  double freqHz   = (double)note_to_freq(note);
+  uint16_t center = PW_CENTER[pwCh];
+
+  double   targetDuty = (dir == PW_LIMIT_LOW) ? kPWLowDutyFraction  : kPWHighDutyFraction;  // 2% or 98%
+  uint16_t minPW      = (dir == PW_LIMIT_LOW) ? 0                   : center;
+  uint16_t maxPW      = (dir == PW_LIMIT_LOW) ? center              : DIV_COUNTER_PW;
+  uint16_t seedPW     = (dir == PW_LIMIT_LOW) ? (center * 0.15)     : (center + (DIV_COUNTER_PW - center) * 0.85);
+
+  const char *tag = (dir == PW_LIMIT_LOW) ? "PW_LOW" : "PW_HIGH";
+  Serial.println((String)"[" + tag + "_START] DCO=" + currentDCO + " ch=" + pwCh +
+  " target=" + String(targetDuty * 100.0, 1) + "% anchorAmp=" + amp);
+
+  PWSearchResult res = find_pw_for_target_duty(
+    pwCh,
+    targetDuty,
+    kPWLimitDutyTolerance, // ±1%
+    minPW,
+    maxPW,
+    seedPW,
+    freqHz
+  );
+
+  if (calibrationCancelRequested) return;
+
+  uint16_t finalLimitPW = res.ok ? res.pw : (dir == PW_LIMIT_LOW ? PW_LOW_LIMIT[pwCh] : PW_HIGH_LIMIT[pwCh]);
+
+  if (res.ok) {
+    if (dir == PW_LIMIT_LOW) {
+      PW_LOW_LIMIT[pwCh] = res.pw;
+      update_FS_PW_Low_Limit(pwCh, res.pw);
+    } else {
+      PW_HIGH_LIMIT[pwCh] = res.pw;
+      update_FS_PW_High_Limit(pwCh, res.pw);
+    }
+
+    Serial.println((String)"[" + tag + "_RESULT] ch=" + pwCh + " LIMIT=" + res.pw +
+    " duty=" + String(res.duty * 100.0, 2) + "% (" + res.probes + " probes)");
+  } else {
+    Serial.println((String)"[" + tag + "_FAIL] ch=" + pwCh + " keeping previous=" + finalLimitPW);
+  }
+
+  // Restore center after sweep
+  apply_pw_center(pwCh);
 }
 
 // =============================================================================
@@ -663,9 +693,15 @@ void cal_report_set_pair_from_gap(int pair, float gapUs, float freqHz, uint8_t s
   cal_report_set_pair(pair, duty_err_pct_from_gap(gapUs, freqHz), src);
 }
 
+// =============================================================================
+// Detailed Per-Oscillator Calibration Report
+// =============================================================================
+
 static String cal_pad_left(const String& s, int width) {
   String out = s;
-  while ((int)out.length() < width) out = " " + out;
+  while ((int)out.length() < width) {
+    out = " " + out;
+  }
   return out;
 }
 
@@ -683,21 +719,32 @@ static const char *cal_point_source_name(uint8_t src) {
   }
 }
 
+// Print the complete calibration table and metrics for one oscillator
 void print_calibration_report(uint8_t dcoIndex, const uint32_t *data) {
   if (autotuneDebug < 1) return;
 
-  String header = (String)"[CAL_REPORT] DCO=" + dcoIndex + " method=" +
-                  ((calibrationPrecision == CAL_PRECISION_FINE) ? "REFINE" : autotune_amp_method_name(autotuneAmpMethod)) +
-                  " precision=" + calibration_precision_name(calibrationPrecision) +
-                  " search=" + autotune_search_mode_name(autotuneSearchMode);
-  if (calReportLadderInterval > 0) header += (String)" ladder=" + calReportLadderInterval + " semitones";
-  if (calReportAnchorPair >= 0)     header += (String)" anchorPair=" + calReportAnchorPair;
-
+  String header = (String)"\n[CAL_REPORT] DCO=" + dcoIndex +
+  " method=" +
+  ((calibrationPrecision == CAL_PRECISION_FINE)
+  ? "REFINE"
+  : autotune_amp_method_name(autotuneAmpMethod)) +
+  " precision=" + calibration_precision_name(calibrationPrecision) +
+  " search=" + autotune_search_mode_name(autotuneSearchMode);
+  if (calReportLadderInterval > 0) {
+    header += (String)" ladder=" + calReportLadderInterval + " semitones";
+  }
+  if (calReportAnchorPair >= 0) {
+    header += (String)" anchorPair=" + calReportAnchorPair;
+  }
   Serial.println(header);
   Serial.println("[CAL_REPORT] pair    freqHz  ampComp  dutyErr%     gapUs    1cnt%  src");
 
-  float errSum = 0.0f, worstErr = -1.0f;
-  int errCount = 0, worstPair = -1, measured = 0, highestPair = -1;
+  float    errSum      = 0.0f;
+  int      errCount    = 0;
+  float    worstErr    = -1.0f;
+  int      worstPair   = -1;
+  int      measured    = 0;
+  int      highestPair = -1;
 
   for (int p = 0; p < kCalReportPairs; ++p) {
     const float    freqHz = (float)data[2 * p] / 100.0f;
@@ -707,41 +754,194 @@ void print_calibration_report(uint8_t dcoIndex, const uint32_t *data) {
     const float    err    = calPointDutyErrPct[p];
     const bool     hasErr = (fabsf(err) < 1e8f);
 
-    if (!isSent) highestPair = p;
-    if (src == CAL_SRC_RUNG || src == CAL_SRC_ANCHOR || src == CAL_SRC_ENDPOINT_FULL ||
-        src == CAL_SRC_ENDPOINT_AMP0 || src == CAL_SRC_REFINED) {
-      ++measured;
+    if (!isSent) {
+      highestPair = p;
     }
+    if (src == CAL_SRC_RUNG || src == CAL_SRC_ANCHOR ||
+      src == CAL_SRC_ENDPOINT_FULL || src == CAL_SRC_ENDPOINT_AMP0 ||
+      src == CAL_SRC_REFINED) {
+      ++measured;
+      }
 
-    String line = "[CAL_REPORT] " + cal_pad_left(String(p), 4);
+      String line = "[CAL_REPORT] " + cal_pad_left(String(p), 4);
     line += cal_pad_left(isSent ? String("-") : fmt_freq(freqHz), 10);
     line += cal_pad_left(String(amp), 9);
 
     if (hasErr) {
-      float absErr = fabsf(err);
+      const float absErr = fabsf(err);
       errSum += absErr;
       ++errCount;
-      if (absErr > worstErr) { worstErr = absErr; worstPair = p; }
-      float gapUs = (freqHz > 0.0f) ? (err * 20000.0f / freqHz) : 0.0f;
+      if (absErr > worstErr) {
+        worstErr  = absErr;
+        worstPair = p;
+      }
+      const float gapUs = (freqHz > 0.0f) ? (err * 20000.0f / freqHz) : 0.0f;
       line += cal_pad_left(String(err, 3), 10);
       line += cal_pad_left(String(gapUs, 2), 10);
     } else {
-      line += cal_pad_left("-", 10) + cal_pad_left("-", 10);
+      line += cal_pad_left("-", 10);
+      line += cal_pad_left("-", 10);
     }
 
-    if (!isSent && amp > 0) line += cal_pad_left(String(50.0f / (float)amp, 3), 9);
-    else                   line += cal_pad_left("-", 9);
-
+    // Quantisation noise floor (1 count error at this amplitude)
+    if (!isSent && amp > 0) {
+      line += cal_pad_left(String(50.0f / (float)amp, 3), 9);
+    } else {
+      line += cal_pad_left("-", 9);
+    }
     line += (String)"  " + cal_point_source_name(src);
     Serial.println(line);
   }
 
+  const float lowestHz  = (float)data[0] / 100.0f;
+  const float highestHz = (highestPair >= 0) ? ((float)data[2 * highestPair] / 100.0f) : 0.0f;
+  String span = "-";
+  if (lowestHz > 0.0f && highestHz > lowestHz) {
+    span = String(log2f(highestHz / lowestHz), 2);
+  }
+  Serial.println((String)"[CAL_REPORT] DCO=" + dcoIndex +
+  " lowest=" + fmt_freq(lowestHz) + " Hz highest=" + fmt_freq(highestHz) +
+  " Hz span=" + span + " octaves measured=" + measured +
+  "/" + kCalReportPairs);
+
+  if (errCount > 0 && worstPair >= 0) {
+    Serial.println((String)"[CAL_REPORT] DCO=" + dcoIndex +
+    " dutyErr avg=" + String(errSum / (float)errCount, 3) +
+    "% worst=" + String(worstErr, 3) +
+    "% at pair " + worstPair +
+    " (" + fmt_freq((float)data[2 * worstPair] / 100.0f) + " Hz)");
+  } else {
+    Serial.println((String)"[CAL_REPORT] DCO=" + dcoIndex +
+    " dutyErr: no measured points");
+  }
+
   const unsigned long elapsedMs = millis() - calRunStartMs;
-  Serial.println((String)"[CAL_REPORT] DCO=" + dcoIndex + " search=" + autotune_search_mode_name(autotuneSearchMode) +
-                 " probes=" + calRunProbes + " elapsed=" + String(elapsedMs / 1000.0f, 1) + " s (" +
-                 String((float)elapsedMs / (float)max(calRunProbes, 1u), 1) + " ms/probe)");
+  Serial.println((String)"[CAL_REPORT] DCO=" + dcoIndex +
+  " search=" + autotune_search_mode_name(autotuneSearchMode) +
+  " probes=" + calRunProbes +
+  " elapsed=" + String(elapsedMs / 1000.0f, 1) + " s" +
+  " (" + String((float)elapsedMs / (float)max(calRunProbes, 1u), 1) +
+  " ms/probe)\n");
 }
 
+// =============================================================================
+// Multi-Oscillator Side-by-Side Summary Report Table
+// =============================================================================
+
+struct OscCalSummary {
+  bool     attempted;
+  bool     ok;
+  bool     cancelled;
+  uint8_t  pwCh;
+  bool     hasPW;
+  uint16_t pwCenter;
+  uint16_t pwLow;
+  uint16_t pwHigh;
+  uint16_t anchorAmp;
+  float    lowestHz;
+  float    highestHz;
+  float    avgDutyErrPct;
+  float    worstDutyErrPct;
+  int      worstPair;
+  float    worstHz;
+  uint32_t probes;
+  uint32_t elapsedMs;
+};
+
+static OscCalSummary g_oscSummary[NUM_OSCILLATORS];
+
+static String cal_col(const String& s, int width, bool rightAlign = true) {
+  String out = s;
+  if ((int)out.length() > width) {
+    out = out.substring(0, width);
+  }
+  while ((int)out.length() < width) {
+    if (rightAlign) out = " " + out;
+    else out = out + " ";
+  }
+  return out;
+}
+
+static void print_multi_osc_summary_table(uint8_t scope, uint8_t precision, uint8_t method) {
+  Serial.println("\n======================================================================================================================");
+  Serial.println((String)"[CAL_SUMMARY] FINAL MULTI-OSCILLATOR CALIBRATION REPORT  (Scope: " +
+  calibration_scope_name(scope) + " | Precision: " +
+  calibration_precision_name(precision) + " | Method: " +
+  autotune_amp_method_name(method) + ")");
+  Serial.println("======================================================================================================================");
+  Serial.println(" DCO |  Type   | Status | PW_CTR (LOW - HIGH) | 440_AMP |  Lowest Hz  |  Highest Hz  | AvgErr% | WorstErr% (Pair @ Hz)  | Probes |  Time ");
+  Serial.println("-----+---------+--------+---------------------+---------+-------------+--------------+---------+------------------------+--------+-------");
+
+  int successCount = 0;
+  int totalProbes  = 0;
+  uint32_t totalTimeMs = 0;
+
+  for (int i = 0; i < NUM_OSCILLATORS; ++i) {
+    const OscCalSummary& s = g_oscSummary[i];
+    totalProbes  += s.probes;
+    totalTimeMs  += s.elapsedMs;
+
+    String line = " " + cal_col(String(i), 3, true) + " | ";
+    line += cal_col(s.hasPW ? "PW/VAR" : "FIXED", 7, false) + " | ";
+
+    if (s.cancelled) {
+      line += cal_col("CANCEL", 6, false) + " | ";
+    } else if (!s.attempted) {
+      line += cal_col("SKIP", 6, false) + " | ";
+    } else if (s.ok) {
+      line += cal_col("OK", 6, false) + " | ";
+      successCount++;
+    } else {
+      line += cal_col("FAILED", 6, false) + " | ";
+    }
+
+    // PW Column
+    if (s.hasPW) {
+      String pwStr = String(s.pwCenter) + " (" + String(s.pwLow) + "-" + String(s.pwHigh) + ")";
+      line += cal_col(pwStr, 19, false) + " | ";
+    } else {
+      line += cal_col("Muted (No PW)", 19, false) + " | ";
+    }
+
+    // Anchor AMP
+    line += cal_col(String(s.anchorAmp), 7, true) + " | ";
+
+    // Lowest & Highest Hz
+    if (s.lowestHz > 0.0f) {
+      line += cal_col(fmt_freq(s.lowestHz) + " Hz", 11, true) + " | ";
+    } else {
+      line += cal_col("-", 11, true) + " | ";
+    }
+
+    if (s.highestHz > 0.0f) {
+      line += cal_col(fmt_freq(s.highestHz) + " Hz", 12, true) + " | ";
+    } else {
+      line += cal_col("-", 12, true) + " | ";
+    }
+
+    // Duty Errors with Worst Pair Breakdown
+    if (s.avgDutyErrPct >= 0.0f) {
+      line += cal_col(String(s.avgDutyErrPct, 3) + "%", 7, true) + " | ";
+      String worstStr = String(s.worstDutyErrPct, 3) + "% (P" + String(s.worstPair) + "@" + fmt_freq(s.worstHz) + ")";
+      line += cal_col(worstStr, 22, false) + " | ";
+    } else {
+      line += cal_col("-", 7, true) + " | ";
+      line += cal_col("-", 22, false) + " | ";
+    }
+
+    // Probes & Time
+    line += cal_col(String(s.probes), 6, true) + " | ";
+    line += cal_col(String(s.elapsedMs / 1000.0f, 1) + "s", 5, true);
+
+    Serial.println(line);
+  }
+
+  Serial.println("======================================================================================================================");
+  Serial.println((String)"Summary: " + successCount + "/" + NUM_OSCILLATORS +
+  " Oscillators Calibrated Successfully | Total Probes: " + totalProbes +
+  " | Total Duration: " + String(totalTimeMs / 1000.0f, 1) + "s");
+  Serial.println("======================================================================================================================\n");
+}
 // =============================================================================
 // Diagnostic Sweeps, Probes & Manual Gap Tracking
 // =============================================================================
@@ -881,6 +1081,7 @@ void DCO_calibration_debug() {
   serialSendParam32(PARAM_GAP_FROM_DCO, (uint32_t)dutyErrorPercentTimes100, true);
 }
 
+
 // =============================================================================
 // Master Auto-Calibration Entry Point
 // =============================================================================
@@ -889,76 +1090,231 @@ void DCO_calibration() {
   autotune_fill_init_manual_amp();
   calibrationCancelRequested = false;
 
-  const uint8_t scope   = calibrationScope;
-  const bool    runPW   = calibration_scope_runs_pw(scope);
-  const bool    runAmp  = calibration_scope_runs_amp(scope);
-  const bool    fine    = (calibrationPrecision == CAL_PRECISION_FINE);
+  const uint8_t scope     = calibrationScope;
+  const bool    runPW     = calibration_scope_runs_pw(scope);
+  const bool    runAmp    = calibration_scope_runs_amp(scope);
+  const bool    fine      = (calibrationPrecision == CAL_PRECISION_FINE);
 
+  // Initialize summary tracking
+  for (int i = 0; i < NUM_OSCILLATORS; ++i) {
+    uint8_t ch = cal_pw_channel(i);
+    g_oscSummary[i].attempted       = false;
+    g_oscSummary[i].ok              = false;
+    g_oscSummary[i].cancelled       = false;
+    g_oscSummary[i].pwCh            = ch;
+    g_oscSummary[i].hasPW           = osc_has_pw(i);
+    g_oscSummary[i].pwCenter        = PW_CENTER[ch];
+    g_oscSummary[i].pwLow           = PW_LOW_LIMIT[ch];
+    g_oscSummary[i].pwHigh          = PW_HIGH_LIMIT[ch];
+    g_oscSummary[i].anchorAmp       = ampComp440[i];
+    g_oscSummary[i].lowestHz        = 0.0f;
+    g_oscSummary[i].highestHz       = 0.0f;
+    g_oscSummary[i].avgDutyErrPct   = -1.0f;
+    g_oscSummary[i].worstDutyErrPct = -1.0f;
+    g_oscSummary[i].probes          = 0;
+    g_oscSummary[i].elapsedMs       = 0;
+  }
+
+  Serial.println("\n=======================================================");
+  Serial.println((String)"[DCO_CAL] *** CALIBRATION STARTED *** Scope: " + calibration_scope_name(scope));
+  Serial.println((String)"[DCO_CAL] Precision: " + calibration_precision_name(calibrationPrecision) +
+  " | Method: " + autotune_amp_method_name(autotuneAmpMethod));
+
+  Serial.println("\n--- [RECALLED STORED PARAMETERS] ---");
+  for (int i = 0; i < NUM_OSCILLATORS; ++i) {
+    uint8_t ch = cal_pw_channel(i);
+    Serial.println((String)"  DCO " + i + ": ampComp440=" + ampComp440[i] +
+    " | manualOffset=" + manualCalibrationOffset[i] +
+    " | dutyOffset=" + ampCompDutyOffset[i] +
+    " | PW_CENTER[ch " + ch + "]=" + PW_CENTER[ch] +
+    " | PW_LOW=" + PW_LOW_LIMIT[ch] + " | PW_HIGH=" + PW_HIGH_LIMIT[ch]);
+  }
+  Serial.println("=======================================================\n");
+
+  // =========================================================================
+  // THE CRITICAL FIX: THE GLOBAL ANALOG DRAIN PHASE
+  // =========================================================================
+  Serial.println("[DCO_CAL] ---> DRAINING ANALOG BUS (Waiting for RC filters to reach 0V)...");
   disable_all_oscillators_and_range_pwm();
 
-  if (runPW) {
+  // Wait 2.5 seconds to guarantee all capacitors bleed completely dry.
+  // This physically mirrors the time it takes a human to click through to Manual Calibration.
+  delay(2500);
+
+  Serial.println("[DCO_CAL] ---> Analog bus stabilized. Beginning individual DCO tuning.\n");
+  // =========================================================================
+
+  bool anyTableUpdated = false;
+  bool allSucceeded    = true;
+
+  // 1. PW Calibration Stage
+  if (runPW && !calibrationCancelRequested) {
+    Serial.println("\n[DCO_CAL] ---> Starting PW Calibration Stage");
     uint8_t lastCh = 0xFF;
-    for (uint8_t osc = 0; osc < NUM_OSCILLATORS && !calibrationCancelRequested; ++osc) {
+    for (uint8_t osc = 0; osc < NUM_OSCILLATORS; ++osc) {
+      if (calibrationCancelRequested) break;
+      if (!osc_has_pw(osc)) continue;
+
       const uint8_t ch = cal_pw_channel(osc);
       if (ch == lastCh || PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
       lastCh = ch;
       currentDCO = osc;
+
+      Serial.println((String)"\n[DCO_CAL] Calibrating PW for Channel " + ch + " (Osc " + osc + ")");
       restart_DCO_calibration();
       DCO_calibration_current_note = manual_DCO_calibration_start_note;
       VOICE_NOTES[0] = DCO_calibration_current_note;
+
       find_PW_center(0);
       if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_LOW);
       if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_HIGH);
+
+      for (int k = 0; k < NUM_OSCILLATORS; ++k) {
+        if (cal_pw_channel(k) == ch) {
+          g_oscSummary[k].pwCenter = PW_CENTER[ch];
+          g_oscSummary[k].pwLow    = PW_LOW_LIMIT[ch];
+          g_oscSummary[k].pwHigh   = PW_HIGH_LIMIT[ch];
+        }
+      }
     }
   }
 
-  for (int i = 0; runAmp && i < NUM_OSCILLATORS && !calibrationCancelRequested; i++) {
-    currentDCO = i;
-    restart_DCO_calibration();
-
-    ampCompCalibrationVal = initManualAmpCompCalibrationVal[currentDCO] + manualCalibrationOffset[currentDCO];
-    write_range_pwm(currentDCO, ampCompCalibrationVal);
-
-    DCO_calibration_current_note = DCO_calibration_start_note;
-    VOICE_NOTES[0] = DCO_calibration_current_note;
-
-    DCOCalibrationContext ctx(
-      currentDCO, DCO_calibration_current_note, calibrationData,
-      manualCalibrationOffset, initManualAmpCompCalibrationVal
-    );
-
-    bool tableOk = true;
-    cal_report_reset();
-
-    if (fine) {
-      tableOk = refine_DCO_amp_table(ctx);
-    } else if (autotuneAmpMethod == AMP_METHOD_FREQ_TRACE) {
-      tableOk = calibrate_DCO_freq_trace(ctx);
-    } else {
-      cal_report_set_pair(0, kCalDutyErrUnknown, CAL_SRC_FILLED);
-      cal_report_set_pair(1, kCalDutyErrUnknown, CAL_SRC_MANUAL);
-      calibrate_DCO(ctx, 0.001);
-    }
-
-    if (!fine && autotuneAmpMethod != AMP_METHOD_FREQ_TRACE && !calibrationCancelRequested && tableOk) {
-      if (autotuneAmp0Mode == AMP0_MODE_CALC || calibrationPrecision == CAL_PRECISION_FAST) {
-        // FAST / CALC skips live hunt
-      } else {
-        apply_measured_lowest_freq(ctx);
+  // 2. Amp Compensation Calibration Stage
+  if (runAmp && !calibrationCancelRequested) {
+    Serial.println("\n[DCO_CAL] ---> Starting Amp Compensation Stage");
+    for (int i = 0; i < NUM_OSCILLATORS; i++) {
+      if (calibrationCancelRequested) {
+        g_oscSummary[i].cancelled = true;
+        allSucceeded = false;
+        break;
       }
-    }
 
-    if (!calibrationCancelRequested) print_calibration_report(currentDCO, calibrationData);
+      currentDCO = i;
+      g_oscSummary[i].attempted = true;
 
-    if (!calibrationCancelRequested && tableOk) {
-      update_FS_voice(currentDCO);
+      Serial.println((String)"\n[DCO_CAL] === Calibrating Amplitude for DCO " + i + " ===");
+      restart_DCO_calibration();
+
+      DCOCalibrationContext ctx(
+        currentDCO, DCO_calibration_current_note, calibrationData,
+        manualCalibrationOffset, initManualAmpCompCalibrationVal
+      );
+
+      bool tableOk = true;
+      cal_report_reset();
+
+      if (fine) {
+        tableOk = refine_DCO_amp_table(ctx);
+      } else if (autotuneAmpMethod == AMP_METHOD_FREQ_TRACE) {
+        tableOk = calibrate_DCO_freq_trace(ctx);
+      } else {
+        cal_report_set_pair(0, kCalDutyErrUnknown, CAL_SRC_FILLED);
+        cal_report_set_pair(1, kCalDutyErrUnknown, CAL_SRC_MANUAL);
+        calibrate_DCO(ctx, 0.001);
+      }
+
+      if (!fine && autotuneAmpMethod != AMP_METHOD_FREQ_TRACE && !calibrationCancelRequested && tableOk) {
+        if (autotuneAmp0Mode == AMP0_MODE_CALC || calibrationPrecision == CAL_PRECISION_FAST) {
+          // Skip live hunt
+        } else {
+          apply_measured_lowest_freq(ctx);
+        }
+      }
+
+      // Compute statistics for summary table
+      float errSum = 0.0f, worstErr = 0.0f, worstHz = 0.0f;
+      int   errCount = 0, highestPair = 0, worstPair = -1;
+
+      for (int p = 0; p < kCalReportPairs; ++p) {
+        if (calPointSource[p] != CAL_SRC_SENTINEL && calibrationData[2 * p] > 0) {
+          highestPair = p;
+        }
+        float err = calPointDutyErrPct[p];
+        if (fabsf(err) < 1e8f) {
+          float absErr = fabsf(err);
+          errSum += absErr;
+          errCount++;
+          if (absErr > worstErr) {
+            worstErr  = absErr;
+            worstPair = p;
+            worstHz   = (float)calibrationData[2 * p] / 100.0f;
+          }
+        }
+      }
+
+      g_oscSummary[i].lowestHz        = (float)calibrationData[0] / 100.0f;
+      g_oscSummary[i].highestHz       = (float)calibrationData[2 * highestPair] / 100.0f;
+      g_oscSummary[i].avgDutyErrPct   = (errCount > 0) ? (errSum / (float)errCount) : 0.0f;
+      g_oscSummary[i].worstDutyErrPct = worstErr;
+      g_oscSummary[i].worstPair       = worstPair;
+      g_oscSummary[i].worstHz         = worstHz;
+      g_oscSummary[i].probes          = calRunProbes;
+      g_oscSummary[i].elapsedMs       = millis() - calRunStartMs;
+      g_oscSummary[i].anchorAmp       = ampComp440[i];
+
+      if (calibrationCancelRequested) {
+        g_oscSummary[i].cancelled = true;
+        g_oscSummary[i].ok        = false;
+        allSucceeded = false;
+        Serial.println((String)"[DCO_CAL] DCO=" + currentDCO + " cancelled mid-run. Discarding table.");
+        break;
+      }
+
+      if (tableOk) {
+        g_oscSummary[i].ok = true;
+        update_FS_voice(currentDCO);
+        anyTableUpdated = true;
+        Serial.println((String)"[DCO_CAL] DCO " + currentDCO + " table successfully saved to filesystem.");
+      } else {
+        g_oscSummary[i].ok = false;
+        allSucceeded = false;
+        Serial.println((String)"[DCO_CAL_ERROR] DCO " + currentDCO + " calibration failed! Keeping previous calibration.");
+      }
+
+      print_calibration_report(currentDCO, calibrationData);
     }
+  }
+
+  // Mark skipped oscillators if interrupted early
+  for (int i = 0; i < NUM_OSCILLATORS; ++i) {
+    if (!g_oscSummary[i].attempted && !g_oscSummary[i].cancelled) {
+      if (calibrationCancelRequested) g_oscSummary[i].cancelled = true;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 3. Final Summary Report & Exit Clean-Up
+  // ---------------------------------------------------------------------------
+  print_multi_osc_summary_table(scope, calibrationPrecision, autotuneAmpMethod);
+
+  if (calibrationCancelRequested) {
+    Serial.println("\n=======================================================");
+    Serial.println("[DCO_CAL] *** CALIBRATION CANCELLED / STOPPED BY USER ***");
+    Serial.println("=======================================================\n");
+  } else if (!allSucceeded) {
+    Serial.println("\n=======================================================");
+    Serial.println("[DCO_CAL] *** CALIBRATION FINISHED WITH ERRORS (SOME DCOs FAILED) ***");
+    Serial.println("=======================================================\n");
+  } else {
+    Serial.println("\n=======================================================");
+    Serial.println("[DCO_CAL] *** CALIBRATION FINISHED SUCCESSFULLY (ALL DCOs OK) ***");
+    Serial.println("=======================================================\n");
+  }
+
+  if (anyTableUpdated) {
+    init_FS();
+    precompute_amp_comp_for_engine();
   }
 
   calibrationFlag = false;
-  init_FS();
-  precompute_amp_comp_for_engine();
+  calibrationCancelRequested = false;
   restore_voice_engine_after_calibration();
+
+  // =========================================================================
+  // CRITICAL: Release the Motherboard from Calibration Mode
+  // Sends Param 150 = 0 back to the Mainboard so it restores standard polyphony
+  // =========================================================================
+  serialSendParam32(PARAM_CALIBRATION_FLAG, 0, true);
 }
 
 #endif  // __AUTOTUNE_IMPL_H__
