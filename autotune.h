@@ -51,6 +51,34 @@ enum CalPointSource : uint8_t {
 };
 
 // =============================================================================
+// PW Calibration Types & Prototypes
+// =============================================================================
+
+enum PWSweepMode : uint8_t {
+  PW_SWEEP_FULL      = 0,  // Full 2% .. 98% sweep (DCO4)
+  PW_SWEEP_HALF_HIGH = 1,  // 50% .. 98% sweep, LOW = CENTER (DCO3 High)
+  PW_SWEEP_HALF_LOW  = 2   // 50% .. 2% sweep, HIGH = CENTER (DCO3 Low)
+};
+
+#ifndef PW_SWEEP_MODE_DEFAULT
+  #if defined(PROJECT_INSTRUMENT) && (PROJECT_INSTRUMENT == 3)
+    #define PW_SWEEP_MODE_DEFAULT PW_SWEEP_HALF_HIGH
+  #else
+    #define PW_SWEEP_MODE_DEFAULT PW_SWEEP_FULL
+  #endif
+#endif
+
+extern uint8_t pwSweepMode;
+
+static inline const char* pw_sweep_mode_name(uint8_t mode) {
+  switch (mode) {
+    case PW_SWEEP_HALF_HIGH: return "HALF_HIGH (50-98%)";
+    case PW_SWEEP_HALF_LOW:  return "HALF_LOW (2-50%)";
+    case PW_SWEEP_FULL:
+    default:                 return "FULL (2-98%)";
+  }
+}
+// =============================================================================
 // Helper Data Structures
 // =============================================================================
 
@@ -293,6 +321,14 @@ struct CalPrecisionOverride {
 // =============================================================================
 // Function Prototypes
 // =============================================================================
+void autotune_drive_core(uint8_t osc, float freqHz, uint16_t ampValue);
+void autotune_manual_task();
+void autotune_loop_task();
+
+void apply_pw_baseline(uint8_t ch);
+void apply_pw_baseline_solo(uint8_t soloCh);
+void apply_pw_center(uint8_t ch);
+void apply_pw_center_solo(uint8_t soloCh);
 
 void DCO_calibration();
 void restart_DCO_calibration();

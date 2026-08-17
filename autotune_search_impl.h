@@ -250,7 +250,7 @@ static void drive_freq(float freqHz, uint16_t amp) {
 
   // EXPLICITLY PROGRAM THE RANGE PWM SLICE HARDWARE
   write_range_pwm(currentDCO, amp);
-  voice_task_autotune(4, amp);
+  autotune_drive_core(currentDCO, freqHz, amp);
   g_lastDrivenFreqHz    = freqHz;
 }
 
@@ -723,7 +723,7 @@ static float measure_gap_for_amp(uint16_t ampPwm) {
 
   // EXPLICITLY PROGRAM THE RANGE PWM SLICE HARDWARE
   write_range_pwm(currentDCO, ampPwm);
-  voice_task_autotune(0, ampPwm);
+  autotune_drive_core(currentDCO, note_to_freq(DCO_calibration_current_note), ampPwm);
   settle_for_freq((double)freqHz);
   ++calRunProbes;
 
@@ -840,7 +840,7 @@ void calibrate_DCO(DCOCalibrationContext& ctx, double dutyErrorFraction) {
     uint16_t minAmpComp = (currentAmpCompCalibrationVal > 200) ? (currentAmpCompCalibrationVal - 200) : 1;
     uint16_t maxAmpComp = min((uint32_t)DIV_COUNTER, (uint32_t)(currentAmpCompCalibrationVal + 300));
 
-    voice_task_autotune(0, currentAmpCompCalibrationVal);
+    autotune_drive_core(currentDCO, freqHz, currentAmpCompCalibrationVal);
     delay(20);
 
     uint16_t bestAmpComp = currentAmpCompCalibrationVal;

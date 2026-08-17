@@ -9,7 +9,6 @@
 // CC_LOCAL_FIRST are block values that midi_cc_apply() writes directly.
 
 #include <stddef.h>
-#include "../params_def.h"
 #include "midi_cc.h"
 
 static const MidiCcEntry midiCcMap[] = {

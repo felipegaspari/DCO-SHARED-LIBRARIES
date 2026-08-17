@@ -14,6 +14,7 @@ bool manualCalibrationFlag = false;
 bool firstTuneFlag = false;
 volatile bool calibrationCancelRequested = false;
 
+uint8_t pwSweepMode = (uint8_t)PW_SWEEP_MODE_DEFAULT;
 uint8_t calibrationScope = CAL_SCOPE_FULL;
 uint8_t calibrationPrecision = CAL_PRECISION_NORMAL;
 uint8_t autotuneAmp0Mode = (uint8_t)AUTOTUNE_AMP0_MODE_DEFAULT;
@@ -112,7 +113,7 @@ static inline void autotune_fill_init_manual_amp() {
   filled = true;
 }
 
-static inline void apply_pw_center(uint8_t ch) {
+inline void apply_pw_center(uint8_t ch) {
   if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return;
 
   uint16_t center = PW_CENTER[ch];
@@ -127,7 +128,7 @@ static inline void apply_pw_center(uint8_t ch) {
   " -> PW_CENTER=" + center + " (Readback CC=" + pw_level_readback(ch) + ")");
 }
 
-static void apply_pw_center_solo(uint8_t soloCh) {
+void apply_pw_center_solo(uint8_t soloCh) {
   for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
     if (PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
     if (ch == soloCh) {
@@ -201,41 +202,28 @@ void restart_DCO_calibration() {
     }
   }
 
-  // 2. CONFIGURE PW FOR ACTIVE OSCILLATOR ONLY
-  const uint8_t pwCh = cal_pw_channel(currentDCO);
-  const bool hasPW   = osc_has_pw(currentDCO);
+// 2. CONFIGURE PW FOR ACTIVE OSCILLATOR ONLY
+const uint8_t pwCh = cal_pw_channel(currentDCO);
+const bool hasPW   = osc_has_pw(currentDCO);
 
-  if (hasPW) {
-    uint16_t center = PW_CENTER[pwCh];
-    // Sanity check: ensure center is a valid square wave
-    if (center < 100 || center > DIV_COUNTER_PW - 100) center = DIV_COUNTER_PW / 2;
-
-    for (int ch = 0; ch < NUM_PW_CHANNELS; ch++) {
-      if (PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
-      if (ch == pwCh) {
-        pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), center);
-        PW[ch] = center;
-      } else {
-        pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
-        PW[ch] = 0;
-      }
-    }
-  } else {
-    // Mute all PW channels for odd/fixed-wave oscillators
-    for (int ch = 0; ch < NUM_PW_CHANNELS; ch++) {
-      if (PW_PINS[ch] != PW_PIN_UNASSIGNED) {
-        pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
-        PW[ch] = 0;
-      }
+if (hasPW) {
+  apply_pw_baseline_solo(pwCh);
+} else {
+  // Mute all PW channels for fixed-wave oscillators
+  for (int ch = 0; ch < NUM_PW_CHANNELS; ch++) {
+    if (PW_PINS[ch] != PW_PIN_UNASSIGNED) {
+      pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
+      PW[ch] = 0;
     }
   }
+}
 
   // 3. APPLY STARTING AMPLITUDE & PITCH TO ACTIVE OSCILLATOR
   ampCompCalibrationVal = initManualAmpCompCalibrationVal[currentDCO] + manualCalibrationOffset[currentDCO];
   write_range_pwm(currentDCO, ampCompCalibrationVal);
 
   // Kickstart frequency exactly how Manual Calibration does it
-  voice_task_autotune(0, ampCompCalibrationVal);
+  autotune_drive_core(currentDCO, note_to_freq(DCO_calibration_current_note), ampCompCalibrationVal);
 
   // 4. Print Hardware Diagnostics
   Serial.println((String)"\n--- [HARDWARE STATE DCO " + currentDCO + "] ---");
@@ -254,6 +242,42 @@ void restart_DCO_calibration() {
 
   // Give the active DCO's analog circuit a moment to rise to its starting baseline
   delay(150);
+}
+
+// Sets PW hardware to its neutral 50% duty baseline:
+// - FULL mode (DCO4): Center is mid-rail / stored PW_CENTER
+// - HALF mode (DCO3): Center is 0V / 0% duty (count 0)
+void apply_pw_baseline(uint8_t ch) {
+  if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return;
+
+  uint16_t level = PW_CENTER[ch];
+
+  if (pwSweepMode == PW_SWEEP_FULL) {
+    // Only DCO4 requires the center to be strictly near the middle (512)
+    if (level < (DIV_COUNTER_PW / 10) || level > (DIV_COUNTER_PW * 9 / 10)) {
+      level = DIV_COUNTER_PW / 2;
+    }
+  } else {
+    // For DCO3 (Half sweep), center is SUPPOSED to be near 0 or 1024.
+    // We only clamp if it's completely uninitialized garbage.
+    if (level > DIV_COUNTER_PW) level = 0; 
+  }
+
+  pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), level);
+  PW[ch] = level;
+}
+
+// Solos the active oscillator's PW baseline while strictly muting all other channels to 0
+void apply_pw_baseline_solo(uint8_t soloCh) {
+  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    if (PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
+    if (ch == soloCh) {
+      apply_pw_baseline(ch);
+    } else {
+      pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
+      PW[ch] = 0;
+    }
+  }
 }
 
 // =============================================================================
@@ -314,7 +338,8 @@ float find_gap(uint8_t specialMode) {
   uint16_t edgesSeen        = 0;
   uint16_t edgesRejected    = 0;
 
-  unsigned long lastEdgeTime   = micros();
+  const unsigned long startUs  = micros(); // Absolute deadline start
+  unsigned long lastEdgeTime   = startUs;
   uint32_t      lastEdgeCycles = rp2040.getCycleCount();
   uint8_t       pollTick       = 0;
 
@@ -327,14 +352,21 @@ float find_gap(uint8_t specialMode) {
     const uint32_t      nowCycles = rp2040.getCycleCount();
     const unsigned long nowUs     = micros();
 
-    if ((nowUs - lastEdgeTime) > timeoutUs) {
+    // 1. Absolute Total Window Timeout OR Inter-edge Silence Timeout:
+    if ((nowUs - startUs) > timeoutUs || (nowUs - lastEdgeTime) > timeoutUs) {
       if (autotuneDebug >= 1) {
         Serial.println((String)"  [GAP_TIMEOUT] DCO=" + currentDCO + " Mode=" + specialMode +
         " Note=" + DCO_calibration_current_note + " Freq=" + fmt_freq((float)freqHz) + "Hz" +
-        " AMP=" + ampCompCalibrationVal + " (RangeCC=" + range_level_readback(currentDCO) +
-        " PW_CC=" + pw_level_readback(cal_pw_channel(currentDCO)) + ")" +
-        " EdgesSeen=" + edgesSeen + " Rej=" + edgesRejected + " Accepted=" + acceptedSamples + "/" + samplesTarget +
-        " TimeoutUs=" + timeoutUs + " RawPin=" + (int)rawVal);
+        " AMP=" + ampCompCalibrationVal + " EdgesSeen=" + edgesSeen + " Rej=" + edgesRejected +
+        " Accepted=" + acceptedSamples + "/" + samplesTarget + " ElapsedUs=" + (nowUs - startUs));
+      }
+      return kGapTimeoutSentinel;
+    }
+
+    // 2. Reject-Loop Guard: prevent high-frequency noise from spinning indefinitely
+    if (edgesRejected > 500) {
+      if (autotuneDebug >= 1) {
+        Serial.println((String)"  [GAP_REJECT_LIMIT] DCO=" + currentDCO + " too many rejected edges (" + edgesRejected + ")");
       }
       return kGapTimeoutSentinel;
     }
@@ -666,22 +698,43 @@ void find_PW_center(uint8_t mode) {
 
   // Force the hardware to the new 440Hz frequency and amplitude
   write_range_pwm(currentDCO, amp);
-  voice_task_autotune((mode == 0) ? 2 : 3, amp);
+  autotune_drive_core(currentDCO, (float)note_to_freq(note), amp);
 
-  double freqHz   = (double)note_to_freq(note);
-  uint16_t startPW = (firstTuneFlag) ? (DIV_COUNTER_PW / 2) : PW_CENTER[pwCh];
-  double dutyTol  = (mode == 0) ? 0.003 : 0.005; // ±0.3% low note, ±0.5% high note
+  double freqHz  = (double)note_to_freq(note);
+  double dutyTol = (mode == 0) ? 0.003 : 0.005; // ±0.3% low note, ±0.5% high note
+
+  // =======================================================================
+  // STRICT MATHEMATICAL BOUNDS BASED ON MANUAL CALIBRATION PHYSICS
+  // =======================================================================
+  uint16_t minPW, maxPW, startPW;
+  
+  if (pwSweepMode == PW_SWEEP_FULL) {
+    // DCO4: Manual trim was performed at mid-rail. Center lives in the middle.
+    startPW = (firstTuneFlag) ? (DIV_COUNTER_PW / 2) : PW_CENTER[pwCh];
+    if (startPW < (DIV_COUNTER_PW / 4) || startPW > (DIV_COUNTER_PW * 3) / 4) {
+      startPW = DIV_COUNTER_PW / 2;
+    }
+    minPW = DIV_COUNTER_PW / 4;       // Bound strictly between 25% and 75%
+    maxPW = (DIV_COUNTER_PW * 3) / 4;
+  } else {
+    // DCO3: Manual trim was performed at EXACTLY 0 counts (0V).
+    // The true 50% square MUST live extremely close to 0.
+    startPW = 0;
+    minPW   = 0;
+    maxPW   = DIV_COUNTER_PW / 10;    // Bound strictly to the bottom 10% (e.g., 0..102)
+  }
 
   Serial.println((String)"[PW_CENTER_START] DCO=" + currentDCO + " ch=" + pwCh +
   " note=" + note + " freq=" + fmt_freq((float)freqHz) +
   " anchorAmp=" + amp + " seed=" + startPW);
 
+  // Pass our strictly bounded limits into the search engine
   PWSearchResult res = find_pw_for_target_duty(
     pwCh,
     kPWCenterDutyFraction,
     dutyTol,
-    0,
-    DIV_COUNTER_PW,
+    minPW,
+    maxPW,
     startPW,
     freqHz
   );
@@ -691,7 +744,7 @@ void find_PW_center(uint8_t mode) {
   if (res.ok) {
     PW_CENTER[pwCh] = res.pw;
     update_FS_PWCenter(pwCh, res.pw);
-    apply_pw_center(pwCh);
+    apply_pw_baseline(pwCh);
 
     // Save achieved duty for the PW summary table
     g_pwSummary[pwCh].pwCenter   = res.pw;
@@ -702,9 +755,9 @@ void find_PW_center(uint8_t mode) {
     String(res.errorFrac * 100.0, 3) + "% (" + res.probes + " probes)");
   } else {
     Serial.println((String)"[PW_CENTER_FAIL] ch=" + pwCh + " keeping previous=" + PW_CENTER[pwCh]);
+    apply_pw_baseline(pwCh); // Make sure hardware is left in a safe state even on fail
   }
 }
-
 // High-level PW Low/High Limit Search
 void find_PW_limit_v2(PWLimitDir dir) {
   // Use 440 Hz anchor for high-speed limit detection
@@ -726,15 +779,26 @@ void find_PW_limit_v2(PWLimitDir dir) {
 
   // Force the hardware to the new 440Hz frequency and amplitude
   write_range_pwm(currentDCO, amp);
-  voice_task_autotune(2, amp);
+  autotune_drive_core(currentDCO, (float)note_to_freq(note), amp);
 
   double freqHz   = (double)note_to_freq(note);
   uint16_t center = PW_CENTER[pwCh];
 
   double   targetDuty = (dir == PW_LIMIT_LOW) ? kPWLowDutyFraction  : kPWHighDutyFraction;  // 2% or 98%
-  uint16_t minPW      = (dir == PW_LIMIT_LOW) ? 0                   : center;
-  uint16_t maxPW      = (dir == PW_LIMIT_LOW) ? center              : DIV_COUNTER_PW;
-  uint16_t seedPW     = (dir == PW_LIMIT_LOW) ? (center * 0.15)     : (center + (DIV_COUNTER_PW - center) * 0.85);
+  
+  // --> FIXED: Dynamically adapt the search bounds so Half-Modes can scan the whole range
+  uint16_t minPW, maxPW, seedPW;
+  if (pwSweepMode == PW_SWEEP_FULL) {
+    minPW  = (dir == PW_LIMIT_LOW) ? 0                   : center;
+    maxPW  = (dir == PW_LIMIT_LOW) ? center              : DIV_COUNTER_PW;
+    seedPW = (dir == PW_LIMIT_LOW) ? (center * 0.15)     : (center + (DIV_COUNTER_PW - center) * 0.85);
+  } else {
+    // For Half modes, the limit lives somewhere across the entire physical range.
+    // Seed away from the center to find the pulse limit faster.
+    minPW  = 0;
+    maxPW  = DIV_COUNTER_PW;
+    seedPW = (center < DIV_COUNTER_PW / 2) ? (DIV_COUNTER_PW * 0.85) : (DIV_COUNTER_PW * 0.15);
+  }
 
   const char *tag = (dir == PW_LIMIT_LOW) ? "PW_LOW" : "PW_HIGH";
   Serial.println((String)"[" + tag + "_START] DCO=" + currentDCO + " ch=" + pwCh +
@@ -772,7 +836,8 @@ void find_PW_limit_v2(PWLimitDir dir) {
   }
 
   // Restore center after sweep
-  apply_pw_center(pwCh);
+  // --> FIXED: Use apply_pw_baseline instead of apply_pw_center so we don't accidentally clamp to 512
+  apply_pw_baseline(pwCh); 
 }
 
 // =============================================================================
@@ -1036,7 +1101,8 @@ static void print_multi_osc_summary_table(uint8_t scope, uint8_t precision, uint
 // Print dedicated PW-only summary table
 static void print_pw_summary_table() {
   Serial.println("\n======================================================================================================================");
-  Serial.println("[PW_SUMMARY] FINAL PULSE-WIDTH (PW) CALIBRATION REPORT  (Reference: 440.0 Hz / Note 81)");
+  Serial.println((String)"[PW_SUMMARY] FINAL PULSE-WIDTH (PW) CALIBRATION REPORT (Mode: " +
+                 pw_sweep_mode_name(pwSweepMode) + " | Ref: 440.0 Hz)");
   Serial.println("======================================================================================================================");
   Serial.println(" Ch | Pin  | Oscs  | Status |   PW_CENTER (Duty)   |    PW_LOW (Duty)     |    PW_HIGH (Duty)    | Span | Probes | Time ");
   Serial.println("----+------+-------+--------+----------------------+----------------------+----------------------+------+--------+------");
@@ -1342,7 +1408,8 @@ void DCO_calibration() {
   // 1. PW Calibration Stage
   // ---------------------------------------------------------------------------
   if (runPW && !calibrationCancelRequested) {
-    Serial.println("\n[DCO_CAL] ---> Starting PW Calibration Stage");
+    Serial.println((String)"\n[DCO_CAL] ---> Starting PW Calibration Stage (Mode: " +
+                   pw_sweep_mode_name(pwSweepMode) + ")");
     uint8_t lastCh = 0xFF;
     for (uint8_t osc = 0; osc < NUM_OSCILLATORS; ++osc) {
       if (calibrationCancelRequested) break;
@@ -1362,9 +1429,32 @@ void DCO_calibration() {
       DCO_calibration_current_note = manual_cal_reference_note;
       VOICE_NOTES[0] = DCO_calibration_current_note;
 
+      // 1. Always find physical 50% center
       find_PW_center(0);
-      if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_LOW);
-      if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_HIGH);
+
+      // 2. Low Limit Search (or duplicate Center)
+      if (pwSweepMode == PW_SWEEP_FULL || pwSweepMode == PW_SWEEP_HALF_LOW) {
+        if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_LOW);
+      } else {
+        // Half-High: Low limit does not exist, duplicate Center
+        PW_LOW_LIMIT[ch] = PW_CENTER[ch];
+        update_FS_PW_Low_Limit(ch, PW_CENTER[ch]);
+        g_pwSummary[ch].pwLow   = PW_CENTER[ch];
+        g_pwSummary[ch].lowDuty = g_pwSummary[ch].centerDuty;
+        Serial.println((String)"  [PW_LOW] Skipped (HALF_HIGH mode) -> Cloned PW_CENTER=" + PW_CENTER[ch]);
+      }
+
+      // 3. High Limit Search (or duplicate Center)
+      if (pwSweepMode == PW_SWEEP_FULL || pwSweepMode == PW_SWEEP_HALF_HIGH) {
+        if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_HIGH);
+      } else {
+        // Half-Low: High limit does not exist, duplicate Center
+        PW_HIGH_LIMIT[ch] = PW_CENTER[ch];
+        update_FS_PW_High_Limit(ch, PW_CENTER[ch]);
+        g_pwSummary[ch].pwHigh   = PW_CENTER[ch];
+        g_pwSummary[ch].highDuty = g_pwSummary[ch].centerDuty;
+        Serial.println((String)"  [PW_HIGH] Skipped (HALF_LOW mode) -> Cloned PW_CENTER=" + PW_CENTER[ch]);
+      }
 
       g_pwSummary[ch].pwCenter  = PW_CENTER[ch];
       g_pwSummary[ch].pwLow     = PW_LOW_LIMIT[ch];
