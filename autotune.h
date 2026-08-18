@@ -1,10 +1,16 @@
 #ifndef __AUTOTUNE_H__
 #define __AUTOTUNE_H__
 
-#include "../include_all.h"
+#include <Arduino.h>
+#include <stdint.h>
+#include <math.h>
+#include "pico/stdlib.h"
+#include "hardware/pwm.h"
+#include "hardware/clocks.h"
 #include "autotune_constants.h"
 #include "autotune_context.h"
 #include "autotune_measurement.h"
+
 
 // =============================================================================
 // Calibration Enums & Scope Selectors

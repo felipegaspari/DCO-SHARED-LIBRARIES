@@ -11,6 +11,13 @@
 
 #include "../include_all.h"
 
+// Pack one uint16 little-endian into a PW bank buffer at voiceN * 2.
+static void pack_pw_u16(uint8_t* bank, uint8_t voiceN, uint16_t value) {
+  bank[voiceN * FSPWDataSize + 0] = (uint8_t)(value & 0xFF);
+  bank[voiceN * FSPWDataSize + 1] = (uint8_t)((value >> 8) & 0xFF);
+}
+
+
 #if PROJECT_INSTRUMENT == 4
 static void ensure_pw_fs_banks();
 #endif
@@ -22,9 +29,13 @@ void init_FS() {
 
   if (!LittleFS.exists("voiceTables")) {
     fileVoiceTablesFS = LittleFS.open("voiceTables", "w+");
+    memset(voiceTablesBankBuffer, 0, FSBankSize); // Safely initialize empty tables
+    fileVoiceTablesFS.write(voiceTablesBankBuffer, FSBankSize);
   } else {
     fileVoiceTablesFS = LittleFS.open("voiceTables", "r");
+    fileVoiceTablesFS.read(voiceTablesBankBuffer, FSBankSize);
   }
+  fileVoiceTablesFS.close();
 
 #ifdef ENABLE_FS_CALIBRATION
 
@@ -80,56 +91,41 @@ void init_FS() {
   // PW_CENTER
   if (!LittleFS.exists("PWCenter")) {
     filePWCenterFS = LittleFS.open("PWCenter", "w+");
+    for (uint8_t v = 0; v < NUM_PW_CHANNELS; ++v) {
+      pack_pw_u16(PWCenterBankBuffer, v, kPwCenterDefault[v]);
+    }
+    filePWCenterFS.write(PWCenterBankBuffer, FSPWBankSize);
   } else {
     filePWCenterFS = LittleFS.open("PWCenter", "r");
+    filePWCenterFS.read(PWCenterBankBuffer, FSPWBankSize);
   }
-
-  filePWCenterFS.read(PWCenterBankBuffer, FSPWBankSize);
   filePWCenterFS.close();
 
-  for (int i = 0; i < NUM_PW_CHANNELS; i++) {
-    uint16_t uint16Data;
-    for (int j = 0; j < FSPWDataSize; j++) {
-      ((uint8_t *)&uint16Data)[j] = PWCenterBankBuffer[i * 2 + j];
-    }
-
-    PW_CENTER[i] = (uint16_t)uint16Data;
-  }
   // PW_HIGH_LIMIT
-    if (!LittleFS.exists("PWHighLimit")) {
+  if (!LittleFS.exists("PWHighLimit")) {
     filePWHighLimitFS = LittleFS.open("PWHighLimit", "w+");
+    for (uint8_t v = 0; v < NUM_PW_CHANNELS; ++v) {
+      pack_pw_u16(PWHighLimitBankBuffer, v, DIV_COUNTER_PW);
+    }
+    filePWHighLimitFS.write(PWHighLimitBankBuffer, FSPWBankSize);
   } else {
     filePWHighLimitFS = LittleFS.open("PWHighLimit", "r");
+    filePWHighLimitFS.read(PWHighLimitBankBuffer, FSPWBankSize);
   }
-
-  filePWHighLimitFS.read(PWHighLimitBankBuffer, FSPWBankSize);
   filePWHighLimitFS.close();
 
-  for (int i = 0; i < NUM_PW_CHANNELS; i++) {
-    uint16_t uint16Data;
-    for (int j = 0; j < FSPWDataSize; j++) {
-      ((uint8_t *)&uint16Data)[j] = PWHighLimitBankBuffer[i * 2 + j];
-    }
-    PW_HIGH_LIMIT[i] = (uint16_t)uint16Data;
-  }
   // PW_LOW_LIMIT
   if (!LittleFS.exists("PWLowLimit")) {
     filePWLowLimitFS = LittleFS.open("PWLowLimit", "w+");
+    for (uint8_t v = 0; v < NUM_PW_CHANNELS; ++v) {
+      pack_pw_u16(PWLowLimitBankBuffer, v, 0);
+    }
+    filePWLowLimitFS.write(PWLowLimitBankBuffer, FSPWBankSize);
   } else {
     filePWLowLimitFS = LittleFS.open("PWLowLimit", "r");
+    filePWLowLimitFS.read(PWLowLimitBankBuffer, FSPWBankSize);
   }
-
-  filePWLowLimitFS.read(PWLowLimitBankBuffer, FSPWBankSize);
   filePWLowLimitFS.close();
-
-  for (int i = 0; i < NUM_PW_CHANNELS; i++) {
-    uint16_t uint16Data;
-    for (int j = 0; j < FSPWDataSize; j++) {
-      ((uint8_t *)&uint16Data)[j] = PWLowLimitBankBuffer[i * 2 + j];
-    }
-    PW_LOW_LIMIT[i] = (uint16_t)uint16Data;
-  }
-
   // Manual calibration offsets (one signed byte per oscillator).
   if (!LittleFS.exists("ManualOffset")) {
     fileManualOffsetFS = LittleFS.open("ManualOffset", "w+");
@@ -335,13 +331,6 @@ void write_fs_bank(const char* name, const uint8_t* data, size_t size) {
   f.write(data, size);
   f.close();
 }
-
-// Pack one uint16 little-endian into a PW bank buffer at voiceN * 2.
-static void pack_pw_u16(uint8_t* bank, uint8_t voiceN, uint16_t value) {
-  bank[voiceN * FSPWDataSize + 0] = (uint8_t)(value & 0xFF);
-  bank[voiceN * FSPWDataSize + 1] = (uint8_t)((value >> 8) & 0xFF);
-}
-
 #if PROJECT_INSTRUMENT == 4
 static bool fs_file_size_ok(const char* name, size_t expected) {
   File f = LittleFS.open(name, "r");
