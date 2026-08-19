@@ -81,11 +81,11 @@ static void mcp_dac_fill_present() {
 
 static void mcp_dac_report(const char* tag) {
   char line[72];
-  snprintf(line, sizeof(line), "[mcp] %s0x63=%s 0x64=%s 0x65=%s err=0x%lx\n",
+  snprintf(line, sizeof(line), "[mcp] %s0x63=%s 0x64=%s 0x65=%s\n",
            tag,
-           mcp_present[0] ? "ok" : "miss",
-           mcp_present[1] ? "ok" : "miss",
-           mcp_present[2] ? "ok" : "miss",
+           mcp_present[0] ? "OK !!! :)" : "DEAD XO",
+           mcp_present[1] ? "OK !!! :)" : "DEAD XO",
+           mcp_present[2] ? "OK !!! :)" : "DEAD XO",
            (unsigned long)mcp_i2c_last_error());
   mcp_diag_print(line);
 }

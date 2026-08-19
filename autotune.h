@@ -11,7 +11,6 @@
 #include "autotune_context.h"
 #include "autotune_measurement.h"
 
-
 // =============================================================================
 // Calibration Enums & Scope Selectors
 // =============================================================================
@@ -56,10 +55,6 @@ enum CalPointSource : uint8_t {
   CAL_SRC_REFINED
 };
 
-// =============================================================================
-// PW Calibration Types & Prototypes
-// =============================================================================
-
 enum PWSweepMode : uint8_t {
   PW_SWEEP_FULL      = 0,  // Full 2% .. 98% sweep (DCO4)
   PW_SWEEP_HALF_HIGH = 1,  // 50% .. 98% sweep, LOW = CENTER (DCO3 High)
@@ -84,6 +79,12 @@ static inline const char* pw_sweep_mode_name(uint8_t mode) {
     default:                 return "FULL (2-98%)";
   }
 }
+
+enum PWLimitDir : uint8_t {
+  PW_LIMIT_LOW  = 0,
+  PW_LIMIT_HIGH = 1
+};
+
 // =============================================================================
 // Helper Data Structures
 // =============================================================================
@@ -96,15 +97,6 @@ struct FreqSearchBounds {
   float hiHz;
 };
 
-// =============================================================================
-// PW Calibration Types & Prototypes
-// =============================================================================
-
-enum PWLimitDir : uint8_t {
-  PW_LIMIT_LOW  = 0,
-  PW_LIMIT_HIGH = 1
-};
-
 struct PWSearchResult {
   bool     ok;           // True if search converged on a valid signal
   uint16_t pw;           // Chosen PW PWM level
@@ -112,21 +104,6 @@ struct PWSearchResult {
   double   errorFrac;    // Deviation from target duty fraction (duty - targetDuty)
   int      probes;       // Number of probes spent
 };
-
-// High-level PW calibration entry points
-void find_PW_center(uint8_t mode = 0);
-void find_PW_limit_v2(PWLimitDir dir);
-
-// Low-level modern search engine
-PWSearchResult find_pw_for_target_duty(
-  uint8_t  pwCh,
-  double   targetDutyFraction,
-  double   dutyToleranceFraction,
-  uint16_t pwMin,
-  uint16_t pwMax,
-  uint16_t pwSeed,
-  double   freqHz
-);
 
 // =============================================================================
 // Global State Declarations (extern)
@@ -175,10 +152,13 @@ constexpr uint16_t initManualAmpCompCalibrationValPreset =
 
 extern uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
 extern volatile uint16_t ampCompLowestFreqVal;
-extern uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
-extern volatile uint16_t ampCompLowestFreqVal;
 extern uint8_t DCO_calibration_current_note;
 extern byte autotuneDebug;
+
+// External references to 3-point limits and cache defined in FS_impl.h
+extern PWCalLimits  PW_CAL_LIMITS[NUM_PW_CHANNELS][kPWCalPoints];
+extern uint8_t      ampCompTopPair[NUM_OSCILLATORS];
+extern PWTrackCache pwTrackCache[NUM_PW_CHANNELS];
 
 // =============================================================================
 // Note and Pitch Constants
@@ -237,7 +217,6 @@ static inline uint8_t cal_pw_channel(uint8_t osc) {
   return (uint8_t)(osc / (NUM_OSCILLATORS / NUM_PW_CHANNELS));
 }
 
-// Hardware readback of the live PWM compare register for a PW channel
 static inline uint16_t pw_level_readback(uint8_t ch) {
   if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return 0;
   const uint32_t cc = pwm_hw->slice[PW_PWM_SLICES[ch]].cc;
@@ -245,7 +224,6 @@ static inline uint16_t pw_level_readback(uint8_t ch) {
   : (uint16_t)(cc >> 16);
 }
 
-// Hardware readback of the live PWM compare register for a RANGE amplitude pin
 static inline uint16_t range_level_readback(uint8_t dco) {
   if (dco >= NUM_OSCILLATORS) return 0;
   uint slice = pwm_gpio_to_slice_num(RANGE_PINS[dco]);
@@ -254,7 +232,6 @@ static inline uint16_t range_level_readback(uint8_t dco) {
   return (channel == PWM_CHAN_A) ? (uint16_t)(cc & 0xFFFFu) : (uint16_t)(cc >> 16);
 }
 
-// Universal check: returns true if oscillator 'osc' has a pulse-width comparator
 static inline bool osc_has_pw(uint8_t osc) {
   if (NUM_PW_CHANNELS == NUM_OSCILLATORS) {
     uint8_t ch = cal_pw_channel(osc);
@@ -314,7 +291,6 @@ static inline void settle_for_freq(double freqHz) {
   delay(settleMs);
 }
 
-// Scoped Precision Override RAII Helper
 struct CalPrecisionOverride {
   uint8_t saved;
   explicit CalPrecisionOverride(uint8_t p = CAL_PRECISION_FINE)
@@ -336,10 +312,23 @@ void apply_pw_baseline_solo(uint8_t soloCh);
 void apply_pw_center(uint8_t ch);
 void apply_pw_center_solo(uint8_t soloCh);
 
+// PW Calibration Entry Points
 void DCO_calibration();
 void restart_DCO_calibration();
-void find_PW_center(uint8_t mode);
+void calibrate_pw_channel_3point(uint8_t ch, uint8_t osc);
+void find_PW_center(uint8_t mode = 0);
 void find_PW_limit_v2(PWLimitDir dir);
+
+PWSearchResult find_pw_for_target_duty(
+  uint8_t  pwCh,
+  double   targetDutyFraction,
+  double   dutyToleranceFraction,
+  uint16_t pwMin,
+  uint16_t pwMax,
+  uint16_t pwSeed,
+  double   freqHz
+);
+
 void run_calibration_verify_sweep();
 void run_pw_cv_probe();
 void DCO_calibration_debug();
@@ -366,5 +355,172 @@ float    quadraticInterpolation(float x0, float y0, float x1, float y1, float x2
 uint16_t logarithmicInterpolation(float x0, float y0, float x1, float y1, float x);
 float    linearInterpolation(float x0, float y0, float x1, float y1, float x);
 double   expInterpolationSolveY(double x, double x0, double x1, double y0, double y1);
+
+// =============================================================================
+// Dual-Engine 3-Point Key-Tracked Pulse-Width Interpolator
+// =============================================================================
+
+#ifdef USE_FLOAT_VOICE_TASK
+
+// --- 1. FLOAT ENGINE (RP2350 with Hardware FPU) ---
+inline uint16_t get_PW_level_interpolated(
+  uint16_t PWval,
+  uint8_t  oscN,
+  float    noteFreqHz = 0.0f,
+  bool     invertPolarity = PW_POLARITY_INVERTED
+) {
+  const uint8_t ch = cal_pw_channel(oscN);
+  if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return 0;
+
+  constexpr int32_t pwMax = (int32_t)(DIV_COUNTER_PW - 1);
+  constexpr int32_t pwMid = (int32_t)(DIV_COUNTER_PW / 2);
+
+  int32_t val = (int32_t)PWval;
+  if (val > pwMax) val = pwMax;
+  if (val < 0)     val = 0;
+
+  if (invertPolarity) {
+    val = pwMax - val;
+  }
+
+  const PWTrackCache& cache = pwTrackCache[ch];
+  int32_t center, lowLim, highLim;
+
+  // Fallback: If frequency is not provided, default to Point 1 (Mid Anchor)
+  if (noteFreqHz <= 0.0f) {
+    center  = (int32_t)PW_CAL_LIMITS[ch][1].center;
+    lowLim  = (int32_t)PW_CAL_LIMITS[ch][1].lowLimit;
+    highLim = (int32_t)PW_CAL_LIMITS[ch][1].highLimit;
+  }
+  // Segment A: Lower Half (f0 .. f1)
+  else if (noteFreqHz <= cache.f1) {
+    if (noteFreqHz <= cache.f0) {
+      center  = (int32_t)PW_CAL_LIMITS[ch][0].center;
+      lowLim  = (int32_t)PW_CAL_LIMITS[ch][0].lowLimit;
+      highLim = (int32_t)PW_CAL_LIMITS[ch][0].highLimit;
+    } else {
+      float t = (noteFreqHz - cache.f0) * cache.invSpan01;
+      center  = (int32_t)(PW_CAL_LIMITS[ch][0].center  + t * (PW_CAL_LIMITS[ch][1].center  - PW_CAL_LIMITS[ch][0].center));
+      lowLim  = (int32_t)(PW_CAL_LIMITS[ch][0].lowLimit + t * (PW_CAL_LIMITS[ch][1].lowLimit - PW_CAL_LIMITS[ch][0].lowLimit));
+      highLim = (int32_t)(PW_CAL_LIMITS[ch][0].highLimit+ t * (PW_CAL_LIMITS[ch][1].highLimit- PW_CAL_LIMITS[ch][0].highLimit));
+    }
+  }
+  // Segment B: Upper Half (f1 .. f2)
+  else {
+    if (noteFreqHz >= cache.f2) {
+      center  = (int32_t)PW_CAL_LIMITS[ch][2].center;
+      lowLim  = (int32_t)PW_CAL_LIMITS[ch][2].lowLimit;
+      highLim = (int32_t)PW_CAL_LIMITS[ch][2].highLimit;
+    } else {
+      float t = (noteFreqHz - cache.f1) * cache.invSpan12;
+      center  = (int32_t)(PW_CAL_LIMITS[ch][1].center  + t * (PW_CAL_LIMITS[ch][2].center  - PW_CAL_LIMITS[ch][1].center));
+      lowLim  = (int32_t)(PW_CAL_LIMITS[ch][1].lowLimit + t * (PW_CAL_LIMITS[ch][2].lowLimit - PW_CAL_LIMITS[ch][1].lowLimit));
+      highLim = (int32_t)(PW_CAL_LIMITS[ch][1].highLimit+ t * (PW_CAL_LIMITS[ch][2].highLimit- PW_CAL_LIMITS[ch][1].highLimit));
+    }
+  }
+
+  // Map user raw PW against the pitch-compensated limits
+  int32_t out;
+  if (pwSweepMode == PW_SWEEP_HALF_LOW) {
+    out = center + (((lowLim - center) * val) / pwMax);
+  } else if (pwSweepMode == PW_SWEEP_HALF_HIGH) {
+    out = center + (((highLim - center) * val) / pwMax);
+  } else {
+    if (val >= pwMid) {
+      out = center + (((highLim - center) * (val - pwMid)) / (pwMax - pwMid));
+    } else {
+      out = lowLim + (((center - lowLim) * val) / pwMid);
+    }
+  }
+
+  if (out < 0) out = 0;
+  if (out > DIV_COUNTER_PW) out = DIV_COUNTER_PW;
+  return (uint16_t)out;
+}
+
+#else
+
+// --- 2. FIXED-POINT ENGINE (RP2040: Zero-Float, Zero-Division Integer MAC) ---
+inline uint16_t get_PW_level_interpolated(
+  uint16_t PWval,
+  uint8_t  oscN,
+  uint32_t noteFreqQ24 = 0,
+  bool     invertPolarity = PW_POLARITY_INVERTED
+) {
+  const uint8_t ch = cal_pw_channel(oscN);
+  if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return 0;
+
+  constexpr int32_t pwMax = (int32_t)(DIV_COUNTER_PW - 1);
+  constexpr int32_t pwMid = (int32_t)(DIV_COUNTER_PW / 2);
+
+  int32_t val = (int32_t)PWval;
+  if (val > pwMax) val = pwMax;
+  if (val < 0)     val = 0;
+
+  if (invertPolarity) {
+    val = pwMax - val;
+  }
+
+  const PWTrackCache& cache = pwTrackCache[ch];
+  int32_t center, lowLim, highLim;
+
+  // Fallback: If frequency is not provided, default to Point 1 (Mid Anchor)
+  if (noteFreqQ24 == 0) {
+    center  = (int32_t)PW_CAL_LIMITS[ch][1].center;
+    lowLim  = (int32_t)PW_CAL_LIMITS[ch][1].lowLimit;
+    highLim = (int32_t)PW_CAL_LIMITS[ch][1].highLimit;
+  }
+  // Segment A: Lower Half (f0 .. f1)
+  else if (noteFreqQ24 <= cache.f1) {
+    if (noteFreqQ24 <= cache.f0) {
+      center  = (int32_t)PW_CAL_LIMITS[ch][0].center;
+      lowLim  = (int32_t)PW_CAL_LIMITS[ch][0].lowLimit;
+      highLim = (int32_t)PW_CAL_LIMITS[ch][0].highLimit;
+    } else {
+      uint32_t deltaF = noteFreqQ24 - cache.f0;
+      // Single-cycle multiply by Q31 reciprocal, shift right by 16 -> Q15 ratio (0..32768)
+      uint32_t t_q15  = (uint32_t)(((uint64_t)deltaF * cache.invSpan01_q24) >> 16);
+
+      center  = (int32_t)PW_CAL_LIMITS[ch][0].center    + ((((int32_t)PW_CAL_LIMITS[ch][1].center    - (int32_t)PW_CAL_LIMITS[ch][0].center)    * (int32_t)t_q15) >> 15);
+      lowLim  = (int32_t)PW_CAL_LIMITS[ch][0].lowLimit  + ((((int32_t)PW_CAL_LIMITS[ch][1].lowLimit  - (int32_t)PW_CAL_LIMITS[ch][0].lowLimit)  * (int32_t)t_q15) >> 15);
+      highLim = (int32_t)PW_CAL_LIMITS[ch][0].highLimit + ((((int32_t)PW_CAL_LIMITS[ch][1].highLimit - (int32_t)PW_CAL_LIMITS[ch][0].highLimit) * (int32_t)t_q15) >> 15);
+    }
+  }
+  // Segment B: Upper Half (f1 .. f2)
+  else {
+    if (noteFreqQ24 >= cache.f2) {
+      center  = (int32_t)PW_CAL_LIMITS[ch][2].center;
+      lowLim  = (int32_t)PW_CAL_LIMITS[ch][2].lowLimit;
+      highLim = (int32_t)PW_CAL_LIMITS[ch][2].highLimit;
+    } else {
+      uint32_t deltaF = noteFreqQ24 - cache.f1;
+      uint32_t t_q15  = (uint32_t)(((uint64_t)deltaF * cache.invSpan12_q24) >> 16);
+
+      center  = (int32_t)PW_CAL_LIMITS[ch][1].center    + ((((int32_t)PW_CAL_LIMITS[ch][2].center    - (int32_t)PW_CAL_LIMITS[ch][1].center)    * (int32_t)t_q15) >> 15);
+      lowLim  = (int32_t)PW_CAL_LIMITS[ch][1].lowLimit  + ((((int32_t)PW_CAL_LIMITS[ch][2].lowLimit  - (int32_t)PW_CAL_LIMITS[ch][1].lowLimit)  * (int32_t)t_q15) >> 15);
+      highLim = (int32_t)PW_CAL_LIMITS[ch][1].highLimit + ((((int32_t)PW_CAL_LIMITS[ch][2].highLimit - (int32_t)PW_CAL_LIMITS[ch][1].highLimit) * (int32_t)t_q15) >> 15);
+    }
+  }
+
+  // Map user raw PW against the pitch-compensated limits
+  int32_t out;
+  if (pwSweepMode == PW_SWEEP_HALF_LOW) {
+    out = center + (((lowLim - center) * val) / pwMax);
+  } else if (pwSweepMode == PW_SWEEP_HALF_HIGH) {
+    out = center + (((highLim - center) * val) / pwMax);
+  } else {
+    if (val >= pwMid) {
+      out = center + (((highLim - center) * (val - pwMid)) / (pwMax - pwMid));
+    } else {
+      out = lowLim + (((center - lowLim) * val) / pwMid);
+    }
+  }
+
+  if (out < 0) out = 0;
+  if (out > DIV_COUNTER_PW) out = DIV_COUNTER_PW;
+  return (uint16_t)out;
+}
+
+#endif
 
 #endif  // __AUTOTUNE_H__

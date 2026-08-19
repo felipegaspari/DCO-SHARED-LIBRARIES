@@ -5,6 +5,10 @@
 #include "autotune.h"
 #include "autotune_search_impl.h"
 
+#ifndef AUTOTUNE_DEBUG_LEVEL
+#define AUTOTUNE_DEBUG_LEVEL 0
+#endif
+
 // =============================================================================
 // Global Variable Definitions
 // =============================================================================
@@ -51,7 +55,7 @@ float g_lastDrivenFreqHz = 0.0f;
 uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
 volatile uint16_t ampCompLowestFreqVal = (uint16_t)(10u * DIV_COUNTER / 14000u);
 uint8_t DCO_calibration_current_note = DCO_calibration_start_note;
-byte autotuneDebug = 2;
+byte autotuneDebug = AUTOTUNE_DEBUG_LEVEL;
 
 static double g_gapLogCurrentPeriodUs = 0.0;
 static double g_gapLogTargetDutyFraction = 0.5;
@@ -117,15 +121,24 @@ inline void apply_pw_center(uint8_t ch) {
   if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED) return;
 
   uint16_t center = PW_CENTER[ch];
-  if (center < (DIV_COUNTER_PW / 10) || center > (DIV_COUNTER_PW * 9 / 10)) {
-    center = DIV_COUNTER_PW / 2;
+
+  if (pwSweepMode == PW_SWEEP_FULL) {
+    // DCO4: Must be near mid-rail (~512)
+    if (center < (DIV_COUNTER_PW / 10) || center > (DIV_COUNTER_PW * 9 / 10)) {
+      center = DIV_COUNTER_PW / 2;
+    }
+  } else {
+    // DCO3: Valid center can live at 0..102 (or near top rail)
+    if (center > DIV_COUNTER_PW) center = 0;
   }
 
   pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), center);
   PW[ch] = center;
 
-  Serial.println((String)"  [PW_HARDWARE] ch=" + ch + " GP" + PW_PINS[ch] +
-  " -> PW_CENTER=" + center + " (Readback CC=" + pw_level_readback(ch) + ")");
+  if (autotuneDebug >= 2) {
+    Serial.println((String)"  [PW_HARDWARE] ch=" + ch + " GP" + PW_PINS[ch] +
+    " -> PW_CENTER=" + center + " (Readback CC=" + pw_level_readback(ch) + ")");
+  }
 }
 
 void apply_pw_center_solo(uint8_t soloCh) {
@@ -148,7 +161,7 @@ static void reset_pw_to_DIV_COUNTER_PW() {
 
 static void restore_voice_engine_after_calibration() {
   for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
-    apply_pw_center(ch);
+    apply_pw_baseline(ch);
   }
   start_voice_sms();
   for (int i = 0; i < NUM_VOICES_TOTAL; i++) {
@@ -283,7 +296,6 @@ void apply_pw_baseline_solo(uint8_t soloCh) {
 // =============================================================================
 // Edge-Timing Core Measurement Routine (find_gap)
 // =============================================================================
-
 float find_gap(uint8_t specialMode) {
   double freqHz = (gapGateFreqHz > 0.0f) ? (double)gapGateFreqHz : (double)note_to_freq(DCO_calibration_current_note);
   double idealPeriodUs = (freqHz > 0.0) ? (1000000.0 / freqHz) : 0.0;
@@ -306,25 +318,45 @@ float find_gap(uint8_t specialMode) {
     }
   }
 
-  unsigned long timeoutUs = kGapTimeoutUs;
+// 1. Inter-edge timeout: silence between two edges (detects dead oscillators)
+  unsigned long edgeTimeoutUs = kGapTimeoutUs;
   if (idealPeriodUs > 0.0) {
     double scaled = idealPeriodUs * kGapTimeoutPeriods;
-    if (scaled > (double)timeoutUs) {
-      timeoutUs = (scaled > (double)kGapTimeoutMaxUs) ? kGapTimeoutMaxUs : (unsigned long)scaled;
+    if (scaled > (double)edgeTimeoutUs) {
+      edgeTimeoutUs = (scaled > (double)kGapTimeoutMaxUs) ? kGapTimeoutMaxUs : (unsigned long)scaled;
     }
   }
 
-  double dtMinUs = 0.0, dtMaxUs = 0.0;
+  // 2. Total session deadline: must accommodate samplesTarget half-periods + pre-roll + margin
+  unsigned long totalSessionTimeoutUs = edgeTimeoutUs * 2;
   if (idealPeriodUs > 0.0) {
-    dtMinUs = idealPeriodUs * 0.01;
-    dtMaxUs = idealPeriodUs * 0.99;
-    if (dtMinUs < (double)kEdgeDebounceMinUs) dtMinUs = (double)kEdgeDebounceMinUs;
-    if (dtMaxUs > (double)timeoutUs)         dtMaxUs = (double)timeoutUs;
+    unsigned long expectedDurationUs = (unsigned long)((double)(samplesTarget + 4) * (idealPeriodUs / 2.0));
+    totalSessionTimeoutUs = max(totalSessionTimeoutUs, expectedDurationUs + edgeTimeoutUs);
+  }
+
+  // 3. Dynamic Debounce & Acceptance Window (Precomputed per frequency)
+  double debounceUs = (double)kEdgeDebounceFloorUs;
+  double dtMinUs    = (double)kEdgeDebounceFloorUs;
+  double dtMaxUs    = (double)edgeTimeoutUs;
+
+  if (idealPeriodUs > 0.0) {
+    // Debounce scales to 0.5% of period, bounded between Floor and Ceil
+    debounceUs = idealPeriodUs * kEdgeDebouncePeriodFraction;
+    if (debounceUs < (double)kEdgeDebounceFloorUs) debounceUs = (double)kEdgeDebounceFloorUs;
+    if (debounceUs > (double)kEdgeDebounceCeilUs)  debounceUs = (double)kEdgeDebounceCeilUs;
+
+    // Minimum pulse acceptance threshold (0.8% of period, floored at debounce time)
+    dtMinUs = idealPeriodUs * 0.008;
+    if (dtMinUs < debounceUs) dtMinUs = debounceUs;
+
+    // Maximum pulse acceptance threshold (99.2% of period)
+    dtMaxUs = idealPeriodUs * 0.992;
+    if (dtMaxUs > (double)edgeTimeoutUs) dtMaxUs = (double)edgeTimeoutUs;
   }
 
   const uint32_t cyclesPerUs    = (uint32_t)(rp2040.f_cpu() / 1000000);
   const double   usPerCycle     = 1.0 / (double)cyclesPerUs;
-  const uint32_t debounceCycles = (uint32_t)kEdgeDebounceMinUs * cyclesPerUs;
+  const uint32_t debounceCycles = (uint32_t)(debounceUs * (double)cyclesPerUs);
   const uint32_t dtMinCycles    = (uint32_t)(dtMinUs * (double)cyclesPerUs);
   const uint32_t dtMaxCycles    = (uint32_t)(dtMaxUs * (double)cyclesPerUs);
 
@@ -338,7 +370,7 @@ float find_gap(uint8_t specialMode) {
   uint16_t edgesSeen        = 0;
   uint16_t edgesRejected    = 0;
 
-  const unsigned long startUs  = micros(); // Absolute deadline start
+  const unsigned long startUs  = micros();
   unsigned long lastEdgeTime   = startUs;
   uint32_t      lastEdgeCycles = rp2040.getCycleCount();
   uint8_t       pollTick       = 0;
@@ -352,8 +384,10 @@ float find_gap(uint8_t specialMode) {
     const uint32_t      nowCycles = rp2040.getCycleCount();
     const unsigned long nowUs     = micros();
 
-    // 1. Absolute Total Window Timeout OR Inter-edge Silence Timeout:
-    if ((nowUs - startUs) > timeoutUs || (nowUs - lastEdgeTime) > timeoutUs) {
+    // Differentiated timeouts:
+    // - (nowUs - lastEdgeTime > edgeTimeoutUs): The pin is silent/dead.
+    // - (nowUs - startUs > totalSessionTimeoutUs): Deadlock guard if noisy edges loop forever.
+    if ((nowUs - lastEdgeTime) > edgeTimeoutUs || (nowUs - startUs) > totalSessionTimeoutUs) {
       if (autotuneDebug >= 1) {
         Serial.println((String)"  [GAP_TIMEOUT] DCO=" + currentDCO + " Mode=" + specialMode +
         " Note=" + DCO_calibration_current_note + " Freq=" + fmt_freq((float)freqHz) + "Hz" +
@@ -363,7 +397,6 @@ float find_gap(uint8_t specialMode) {
       return kGapTimeoutSentinel;
     }
 
-    // 2. Reject-Loop Guard: prevent high-frequency noise from spinning indefinitely
     if (edgesRejected > 500) {
       if (autotuneDebug >= 1) {
         Serial.println((String)"  [GAP_REJECT_LIMIT] DCO=" + currentDCO + " too many rejected edges (" + edgesRejected + ")");
@@ -449,8 +482,10 @@ static GapMeasurement set_pw_and_measure(uint8_t pwCh, uint16_t pw) {
   return measure_gap(2);
 }
 
-// Helper: Program PW hardware, wait for analog settle, and return measured duty (0.0..1.0).
-// Returns -1.0 on timeout / collapsed pulse.
+// =============================================================================
+// Adaptive Multi-Precision PW Search Engine
+// =============================================================================
+
 static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
   if (pwCh >= NUM_PW_CHANNELS || PW_PINS[pwCh] == PW_PIN_UNASSIGNED) return -1.0;
 
@@ -461,7 +496,12 @@ static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
   wait_periods((float)freqHz, prec.settlePeriods, prec.settleMinMs * 1000u);
 
   ++calRunProbes;
+  
+  // --- FIX: Pass real operating frequency to find_gap() ---
+  gapGateFreqHz = (float)freqHz;
   GapMeasurement gm = measure_gap(2);
+  gapGateFreqHz = 0.0f;
+
   if (gm.timedOut || freqHz <= 0.0) {
     if (autotuneDebug >= 2) {
       Serial.println((String)"  [PW_PROBE] Ch=" + pwCh + " PW=" + pw + " -> TIMEOUT (Pulse Collapsed)");
@@ -481,7 +521,6 @@ static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
   return duty;
 }
 
-// Low-level unified PW root-finder with Dead-Zone Edge Detection & 2-Point Regression
 PWSearchResult find_pw_for_target_duty(
   uint8_t  pwCh,
   double   targetDutyFraction,
@@ -497,39 +536,34 @@ PWSearchResult find_pw_for_target_duty(
   }
 
   const CalPrecisionProfile &prec = cal_precision();
-  const int maxProbes = prec.bisectIters;
+  const int maxProbes = prec.bisectIters + 8;
 
-  // Dynamic dead-zone boundaries (discovered when pulses collapse into timeouts)
   int32_t deadLowPW  = (int32_t)pwMin - 1;
   int32_t deadHighPW = (int32_t)pwMax + 1;
 
   bool     haveValid  = false;
-  uint16_t bestPW     = pwSeed;
+  uint16_t bestPW     = constrain(pwSeed, pwMin, pwMax);
   double   bestDuty   = -1.0;
   double   bestAbsErr = 1e9;
 
-  // 2-Point history of valid measurements for slope calculation
   int32_t p0_pw = -1, p1_pw = -1;
   double  p0_duty = 0.0, p1_duty = 0.0;
 
-  double curPW = (double)constrain(pwSeed, pwMin, pwMax);
+  double curPW = (double)bestPW;
 
+  // =========================================================================
+  // STAGE 1: REGRESSION / SECANT HUNT WITH 1-COUNT DECELERATION
+  // =========================================================================
   for (int probe = 0; probe < maxProbes; ++probe) {
-    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 30000UL)) break;
+    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 35000UL)) break;
 
     int32_t testPW32 = (int32_t)lround(curPW);
     testPW32 = constrain(testPW32, (int32_t)pwMin, (int32_t)pwMax);
 
-    // Keep testPW strictly inside the known-alive window
     if (testPW32 <= deadLowPW)  testPW32 = deadLowPW + 1;
     if (testPW32 >= deadHighPW) testPW32 = deadHighPW - 1;
 
-    // If the alive window is exhausted, no further improvement is possible
     if (testPW32 <= deadLowPW || testPW32 >= deadHighPW || testPW32 < (int32_t)pwMin || testPW32 > (int32_t)pwMax) {
-      if (autotuneDebug >= 2) {
-        Serial.println((String)"  [PW_EXHAUSTED] Working window fully explored. Dead bounds: [" +
-        deadLowPW + " .. " + deadHighPW + "]");
-      }
       break;
     }
 
@@ -537,36 +571,19 @@ PWSearchResult find_pw_for_target_duty(
     double duty = measure_pw_duty(pwCh, testPW, freqHz);
     res.probes++;
 
-    // -------------------------------------------------------------------------
-    // CASE 1: TIMEOUT / PULSE COLLAPSED
-    // -------------------------------------------------------------------------
+    // Pulse collapsed (Dead Zone Hit)
     if (duty < 0.0) {
       if (haveValid) {
         if (testPW < bestPW) {
           deadLowPW = max(deadLowPW, (int32_t)testPW);
-          // If the dead count is immediately adjacent to our best working pulse,
-          // we have reached the absolute physical edge of the comparator!
-          if (bestPW - deadLowPW <= 1 && targetDutyFraction < bestDuty) {
-            if (autotuneDebug >= 2) {
-              Serial.println((String)"  [PW_EDGE_LOCK] Reached lowest physical pulse limit at PW=" + bestPW +
-              " (duty=" + String(bestDuty * 100.0, 2) + "%). Dead zone at PW=" + deadLowPW);
-            }
-            break; // Stop immediately, best possible pulse is locked
-          }
-          curPW = (double)(bestPW + deadLowPW) / 2.0; // Bisect toward safety
+          if (bestPW - deadLowPW <= 1 && targetDutyFraction < bestDuty) break;
+          curPW = (double)(bestPW + deadLowPW) / 2.0;
         } else {
           deadHighPW = min(deadHighPW, (int32_t)testPW);
-          if (deadHighPW - bestPW <= 1 && targetDutyFraction > bestDuty) {
-            if (autotuneDebug >= 2) {
-              Serial.println((String)"  [PW_EDGE_LOCK] Reached highest physical pulse limit at PW=" + bestPW +
-              " (duty=" + String(bestDuty * 100.0, 2) + "%). Dead zone at PW=" + deadHighPW);
-            }
-            break; // Stop immediately
-          }
-          curPW = (double)(bestPW + deadHighPW) / 2.0; // Bisect toward safety
+          if (deadHighPW - bestPW <= 1 && targetDutyFraction > bestDuty) break;
+          curPW = (double)(bestPW + deadHighPW) / 2.0;
         }
       } else {
-        // No valid point seen yet: step toward center of allowed range
         double centerApprox = (double)(pwMin + pwMax) / 2.0;
         if (testPW < centerApprox) {
           deadLowPW = max(deadLowPW, (int32_t)testPW);
@@ -579,9 +596,7 @@ PWSearchResult find_pw_for_target_duty(
       continue;
     }
 
-    // -------------------------------------------------------------------------
-    // CASE 2: VALID MEASUREMENT
-    // -------------------------------------------------------------------------
+    // Valid Measurement
     haveValid = true;
     double err = duty - targetDutyFraction;
     double absErr = fabs(err);
@@ -592,35 +607,13 @@ PWSearchResult find_pw_for_target_duty(
       bestDuty   = duty;
     }
 
-    if (autotuneDebug >= 2) {
-      Serial.println((String)"  [PW_PROBE] PW=" + testPW + " duty=" + String(duty * 100.0, 2) +
-      "% (target=" + String(targetDutyFraction * 100.0, 1) +
-      "% err=" + String(err * 100.0, 3) + "%)");
-    }
-
-    // Target achieved within tolerance
     if (absErr <= dutyToleranceFraction) {
       break;
     }
 
-    // Physical boundary limit check: if target wants lower duty, but next lower count is dead
-    if (err > 0.0 && (int32_t)testPW <= deadLowPW + 1) {
-      if (autotuneDebug >= 2) {
-        Serial.println((String)"  [PW_EDGE_LOCK] Target unreachable (requires dead PW < " + (deadLowPW + 1) +
-        "). Keeping best valid PW=" + testPW);
-      }
-      break;
-    }
-    // Physical boundary limit check: if target wants higher duty, but next higher count is dead
-    if (err < 0.0 && (int32_t)testPW >= deadHighPW - 1) {
-      if (autotuneDebug >= 2) {
-        Serial.println((String)"  [PW_EDGE_LOCK] Target unreachable (requires dead PW > " + (deadHighPW - 1) +
-        "). Keeping best valid PW=" + testPW);
-      }
-      break;
-    }
+    if (err > 0.0 && (int32_t)testPW <= deadLowPW + 1) break;
+    if (err < 0.0 && (int32_t)testPW >= deadHighPW - 1) break;
 
-    // Update 2-point valid history for regression
     if (p0_pw < 0) {
       p0_pw = testPW; p0_duty = duty;
     } else if (p1_pw < 0 && testPW != p0_pw) {
@@ -630,44 +623,70 @@ PWSearchResult find_pw_for_target_duty(
       p1_pw = testPW; p1_duty = duty;
     }
 
-    // Calculate next candidate via measured slope regression
-    if (p0_pw >= 0 && p1_pw >= 0 && fabs(p1_duty - p0_duty) > 1e-4) {
+    // Deceleration when close
+    if (absErr < 0.025) {
+      double dir = (err > 0) ? -1.0 : 1.0;
+      if (p0_pw >= 0 && p1_pw >= 0 && (p1_pw != p0_pw)) {
+        double s = (p1_duty - p0_duty) / (double)(p1_pw - p0_pw);
+        if (s < 0.0) dir = -dir;
+      }
+      int32_t step = (absErr < 0.008) ? 1 : 2;
+      curPW = (double)testPW + (dir * step);
+    } else if (p0_pw >= 0 && p1_pw >= 0 && fabs(p1_duty - p0_duty) > 1e-4) {
       double slope = (p1_duty - p0_duty) / (double)(p1_pw - p0_pw);
       double estPW = (double)testPW + (targetDutyFraction - duty) / slope;
-
-      // Damping: prevent huge jumps from noise
-      double maxJump = (double)(pwMax - pwMin) * 0.35;
-      if (estPW < curPW - maxJump) estPW = curPW - maxJump;
-      if (estPW > curPW + maxJump) estPW = curPW + maxJump;
-
-      curPW = estPW;
+      double maxJump = (double)(pwMax - pwMin) * 0.25;
+      curPW = constrain(estPW, curPW - maxJump, curPW + maxJump);
     } else {
-      // Baseline proportional step
       double delta = (targetDutyFraction - duty) * (double)(pwMax - pwMin);
       curPW = (double)testPW + delta;
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // CONFIRMATION AVERAGING PHASE
-  // ---------------------------------------------------------------------------
-  if (haveValid && bestDuty >= 0.0) {
-    int confirmReads = max(1, (int)prec.confirmReads);
-    double sumDuty = 0.0;
-    int validReads = 0;
+  // =========================================================================
+  // STAGE 2: 5-POINT LOCAL NEIGHBORHOOD SWEEP (Gated on Profile Struct)
+  // =========================================================================
+  if (haveValid && prec.pwNeighborhoodSweep) {
+    int32_t refineMin = max((int32_t)pwMin, max(deadLowPW + 1, (int32_t)bestPW - 2));
+    int32_t refineMax = min((int32_t)pwMax, min(deadHighPW - 1, (int32_t)bestPW + 2));
 
-    for (int r = 0; r < confirmReads; ++r) {
-      double d = measure_pw_duty(pwCh, bestPW, freqHz);
-      if (d >= 0.0) {
-        sumDuty += d;
-        validReads++;
+    uint16_t refinedBestPW     = bestPW;
+    double   refinedBestDuty   = bestDuty;
+    double   refinedBestAbsErr = bestAbsErr;
+
+    int numReads = max(1, (int)prec.pwConfirmReads);
+
+    for (int32_t cand = refineMin; cand <= refineMax; ++cand) {
+      if (calibrationCancelRequested) break;
+      double sumDuty = 0.0;
+      int validCount = 0;
+
+      for (int r = 0; r < numReads; ++r) {
+        double d = measure_pw_duty(pwCh, (uint16_t)cand, freqHz);
+        res.probes++;
+        if (d >= 0.0) {
+          sumDuty += d;
+          validCount++;
+        }
+      }
+
+      if (validCount > 0) {
+        double avgDuty = sumDuty / (double)validCount;
+        double absErr = fabs(avgDuty - targetDutyFraction);
+        if (absErr < refinedBestAbsErr) {
+          refinedBestAbsErr = absErr;
+          refinedBestPW     = (uint16_t)cand;
+          refinedBestDuty   = avgDuty;
+        }
       }
     }
 
-    if (validReads > 0) {
-      bestDuty = sumDuty / (double)validReads;
-    }
-
+    res.ok        = true;
+    res.pw        = refinedBestPW;
+    res.duty      = refinedBestDuty;
+    res.errorFrac = refinedBestDuty - targetDutyFraction;
+  } else if (haveValid) {
+    // FAST mode: Return best candidate without neighborhood sweep
     res.ok        = true;
     res.pw        = bestPW;
     res.duty      = bestDuty;
@@ -677,167 +696,209 @@ PWSearchResult find_pw_for_target_duty(
   return res;
 }
 
-// High-level PW Center Search
-void find_PW_center(uint8_t mode) {
-  // Use 440 Hz anchor instead of 16 Hz for massive speedup!
-  uint8_t note = manual_cal_reference_note;
-  DCO_calibration_current_note = note;
-  VOICE_NOTES[0] = note;
+// =============================================================================
+// Dedicated 3-Point Pulse-Width Channel Calibration Helper
+// =============================================================================
 
-  const uint8_t pwCh = cal_pw_channel(currentDCO);
-  if (PW_PINS[pwCh] == PW_PIN_UNASSIGNED) return;
+void calibrate_pw_channel_3point(uint8_t ch, uint8_t osc) {
+  g_pwSummary[ch].attempted = true;
+  uint32_t pwChStartMs      = millis();
+  int      probesBefore     = calRunProbes;
 
-  DCOCalibrationStart = millis();
+  Serial.println((String)"\n[DCO_CAL] === Calibrating 3-Point PW for Channel " + ch + " (Osc " + osc + ") ===");
 
-  // Retrieve the strong 440 Hz amplitude (with fallback for fresh EEPROM/Flash)
-  uint16_t amp = ampComp440[currentDCO];
-  if (amp < 500) {
-    amp = (uint16_t)(DIV_COUNTER / 4); // Safe fallback (~3500)
+  // 1. Determine Operating Point Indices from Amp-Comp Table
+  uint8_t topIdx = ampCompTopPair[osc];
+  if (topIdx < 6 || topIdx >= (chanLevelVoiceDataSize / 2)) {
+    topIdx = 18; // Sane default fallback
   }
-  ampCompCalibrationVal = amp;
 
-  // Force the hardware to the new 440Hz frequency and amplitude
-  write_range_pwm(currentDCO, amp);
-  autotune_drive_core(currentDCO, (float)note_to_freq(note), amp);
+  int anchorIdx = (calReportAnchorPair >= 0) ? calReportAnchorPair : 10;
+  int lowIdx    = max(2, anchorIdx - 5);           // Point 0 (LOW: ~100..150 Hz)
+  int midIdx    = anchorIdx;                       // Point 1 (MID: ~440 Hz Anchor)
+  int highIdx   = max(midIdx + 2, (int)topIdx - 2);// Point 2 (HIGH: TopPair - 2)
 
-  double freqHz  = (double)note_to_freq(note);
-  double dutyTol = (mode == 0) ? 0.003 : 0.005; // ±0.3% low note, ±0.5% high note
+  // 2. Fetch Operating Frequencies & Amplitudes from Stored Table / Flash
+  const int base = osc * chanLevelVoiceDataSize;
 
-  // =======================================================================
-  // STRICT MATHEMATICAL BOUNDS BASED ON MANUAL CALIBRATION PHYSICS
-  // =======================================================================
-  uint16_t minPW, maxPW, startPW;
-  
-  if (pwSweepMode == PW_SWEEP_FULL) {
-    // DCO4: Manual trim was performed at mid-rail. Center lives in the middle.
-    startPW = (firstTuneFlag) ? (DIV_COUNTER_PW / 2) : PW_CENTER[pwCh];
-    if (startPW < (DIV_COUNTER_PW / 4) || startPW > (DIV_COUNTER_PW * 3) / 4) {
-      startPW = DIV_COUNTER_PW / 2;
+  float fPoints[3];
+  uint16_t aPoints[3];
+
+  // Point 0 (LOW)
+  fPoints[0] = (float)freq_to_amp_comp_array[base + 2 * lowIdx] / 100.0f;
+  aPoints[0] = (uint16_t)freq_to_amp_comp_array[base + 2 * lowIdx + 1];
+  if (fPoints[0] <= 0.0f || aPoints[0] == 0) {
+    fPoints[0] = 110.0f; aPoints[0] = ampComp440[osc] / 3;
+  }
+
+  // Point 1 (MID / 440 ANCHOR)
+  fPoints[1] = (float)freq_to_amp_comp_array[base + 2 * midIdx] / 100.0f;
+  aPoints[1] = (uint16_t)freq_to_amp_comp_array[base + 2 * midIdx + 1];
+  if (fPoints[1] <= 0.0f || aPoints[1] == 0) {
+    fPoints[1] = 440.0f; aPoints[1] = ampComp440[osc];
+  }
+
+  // Point 2 (HIGH / TOPPAIR - 2)
+  fPoints[2] = (float)freq_to_amp_comp_array[base + 2 * highIdx] / 100.0f;
+  aPoints[2] = (uint16_t)freq_to_amp_comp_array[base + 2 * highIdx + 1];
+  if (fPoints[2] <= 0.0f || aPoints[2] == 0) {
+    fPoints[2] = 2800.0f; aPoints[2] = (uint16_t)(DIV_COUNTER * 0.75f);
+  }
+
+  const CalPrecisionProfile &prec = cal_precision();
+  double dutyTol = prec.pwDutyTol;
+
+  // 3. Calibrate All 3 Frequency Operating Points
+  for (uint8_t pt = 0; pt < 3; ++pt) {
+    if (calibrationCancelRequested) break;
+
+    float    freqHz = fPoints[pt];
+    uint16_t ampVal = aPoints[pt];
+
+    ampCompCalibrationVal = ampVal;
+    write_range_pwm(osc, ampVal);
+    autotune_drive_core(osc, freqHz, ampVal);
+
+    const char* ptLabel = (pt == 0) ? "LOW" : ((pt == 1) ? "MID/440" : "HIGH");
+    Serial.println((String)"  ---> Tuning PW Point " + pt + " [" + ptLabel + "] @ " + 
+                   fmt_freq(freqHz) + " Hz (AMP=" + ampVal + ")");
+
+    // A. Center Search (Target: 50%)
+    uint16_t minPW = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW / 4) : 0;
+    uint16_t maxPW = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW * 3 / 4) : (DIV_COUNTER_PW / 10);
+    uint16_t seedPW;
+
+    if (calibrationPrecision == CAL_PRECISION_FINE && PW_CAL_LIMITS[ch][pt].center >= minPW && PW_CAL_LIMITS[ch][pt].center <= maxPW) {
+      seedPW = PW_CAL_LIMITS[ch][pt].center;
+    } else {
+      seedPW = (firstTuneFlag) ? (DIV_COUNTER_PW / 2) : PW_CENTER[ch];
+      if (seedPW < minPW || seedPW > maxPW) seedPW = (minPW + maxPW) / 2;
     }
-    minPW = DIV_COUNTER_PW / 4;       // Bound strictly between 25% and 75%
-    maxPW = (DIV_COUNTER_PW * 3) / 4;
-  } else {
-    // DCO3: Manual trim was performed at EXACTLY 0 counts (0V).
-    // The true 50% square MUST live extremely close to 0.
-    startPW = 0;
-    minPW   = 0;
-    maxPW   = DIV_COUNTER_PW / 10;    // Bound strictly to the bottom 10% (e.g., 0..102)
+
+    PWSearchResult resCenter = find_pw_for_target_duty(ch, kPWCenterDutyFraction, dutyTol, minPW, maxPW, seedPW, (double)freqHz);
+    uint16_t center = resCenter.ok ? resCenter.pw : PW_CENTER[ch];
+
+    // B. Low Limit Search (Target: 2%)
+    uint16_t lowMin = 0;
+    uint16_t lowMax = (pwSweepMode == PW_SWEEP_FULL) ? center : DIV_COUNTER_PW;
+    uint16_t lowSeed = (calibrationPrecision == CAL_PRECISION_FINE && PW_CAL_LIMITS[ch][pt].lowLimit > 0 && PW_CAL_LIMITS[ch][pt].lowLimit <= lowMax)
+                       ? PW_CAL_LIMITS[ch][pt].lowLimit : (center * 0.15);
+
+    PWSearchResult resLow;
+    if (pwSweepMode == PW_SWEEP_FULL || pwSweepMode == PW_SWEEP_HALF_LOW) {
+      resLow = find_pw_for_target_duty(ch, kPWLowDutyFraction, dutyTol, lowMin, lowMax, lowSeed, (double)freqHz);
+    } else {
+      resLow = { true, center, kPWCenterDutyFraction, 0.0, 0 }; // HALF_HIGH clones Center
+    }
+
+    // C. High Limit Search (Target: 98%)
+    uint16_t highMin = (pwSweepMode == PW_SWEEP_FULL) ? center : 0;
+    uint16_t highMax = DIV_COUNTER_PW;
+    uint16_t highSeed = (calibrationPrecision == CAL_PRECISION_FINE && PW_CAL_LIMITS[ch][pt].highLimit > highMin && PW_CAL_LIMITS[ch][pt].highLimit < DIV_COUNTER_PW)
+                        ? PW_CAL_LIMITS[ch][pt].highLimit : (center + (DIV_COUNTER_PW - center) * 0.85);
+
+    PWSearchResult resHigh;
+    if (pwSweepMode == PW_SWEEP_FULL || pwSweepMode == PW_SWEEP_HALF_HIGH) {
+      resHigh = find_pw_for_target_duty(ch, kPWHighDutyFraction, dutyTol, highMin, highMax, highSeed, (double)freqHz);
+    } else {
+      resHigh = { true, center, kPWCenterDutyFraction, 0.0, 0 }; // HALF_LOW clones Center
+    }
+
+    // Store into RAM 3-Point Limits Array
+    PW_CAL_LIMITS[ch][pt].center    = center;
+    PW_CAL_LIMITS[ch][pt].lowLimit  = resLow.ok ? resLow.pw : ((pwSweepMode == PW_SWEEP_FULL) ? 0 : center);
+    PW_CAL_LIMITS[ch][pt].highLimit = resHigh.ok ? resHigh.pw : DIV_COUNTER_PW;
+
+    // Capture Mid point (Point 1 / 440 Hz) metrics for summary reporting
+    if (pt == 1) {
+      g_pwSummary[ch].pwCenter   = center;
+      g_pwSummary[ch].centerDuty = resCenter.duty;
+      g_pwSummary[ch].pwLow      = PW_CAL_LIMITS[ch][1].lowLimit;
+      g_pwSummary[ch].lowDuty    = resLow.duty;
+      g_pwSummary[ch].pwHigh     = PW_CAL_LIMITS[ch][1].highLimit;
+      g_pwSummary[ch].highDuty   = resHigh.duty;
+    }
+
+    Serial.println((String)"  [PW_3PT_RESULT] Ch=" + ch + " Pt=" + pt + " [" + ptLabel + "] (" + fmt_freq(freqHz) + "Hz)" +
+                   " -> CTR=" + PW_CAL_LIMITS[ch][pt].center + 
+                   " | LOW=" + PW_CAL_LIMITS[ch][pt].lowLimit + 
+                   " | HIGH=" + PW_CAL_LIMITS[ch][pt].highLimit);
   }
 
-  Serial.println((String)"[PW_CENTER_START] DCO=" + currentDCO + " ch=" + pwCh +
-  " note=" + note + " freq=" + fmt_freq((float)freqHz) +
-  " anchorAmp=" + amp + " seed=" + startPW);
+  g_pwSummary[ch].probes    = calRunProbes - probesBefore;
+  g_pwSummary[ch].elapsedMs = millis() - pwChStartMs;
 
-  // Pass our strictly bounded limits into the search engine
-  PWSearchResult res = find_pw_for_target_duty(
-    pwCh,
-    kPWCenterDutyFraction,
-    dutyTol,
-    minPW,
-    maxPW,
-    startPW,
-    freqHz
-  );
+  if (calibrationCancelRequested) {
+    g_pwSummary[ch].cancelled = true;
+    return;
+  }
 
-  if (calibrationCancelRequested) return;
+  // 4. Commit 3-Point Limits to LittleFS & Apply Baseline
+  update_FS_PW_Channel(ch);
+  apply_pw_baseline(ch);
+  g_pwSummary[ch].ok = true;
+}
 
+// High-level Single-Point Center Entry Point (Fallback / Standalone UI wrapper)
+void find_PW_center(uint8_t mode) {
+  uint8_t osc = currentDCO;
+  uint8_t ch  = cal_pw_channel(osc);
+  if (PW_PINS[ch] == PW_PIN_UNASSIGNED) return;
+
+  uint16_t amp = ampComp440[osc];
+  if (amp < 500) amp = (uint16_t)(DIV_COUNTER / 4);
+
+  calibrate_pw_operating_point_center_only:
+  write_range_pwm(osc, amp);
+  autotune_drive_core(osc, 440.0f, amp);
+
+  const CalPrecisionProfile &prec = cal_precision();
+  uint16_t minPW = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW / 4) : 0;
+  uint16_t maxPW = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW * 3 / 4) : (DIV_COUNTER_PW / 10);
+  uint16_t seedPW = PW_CENTER[ch];
+  if (seedPW < minPW || seedPW > maxPW) seedPW = (minPW + maxPW) / 2;
+
+  PWSearchResult res = find_pw_for_target_duty(ch, kPWCenterDutyFraction, prec.pwDutyTol, minPW, maxPW, seedPW, 440.0);
   if (res.ok) {
-    PW_CENTER[pwCh] = res.pw;
-    update_FS_PWCenter(pwCh, res.pw);
-    apply_pw_baseline(pwCh);
-
-    // Save achieved duty for the PW summary table
-    g_pwSummary[pwCh].pwCenter   = res.pw;
-    g_pwSummary[pwCh].centerDuty = res.duty;
-
-    Serial.println((String)"[PW_CENTER_RESULT] ch=" + pwCh + " PW_CENTER=" + res.pw +
-    " duty=" + String(res.duty * 100.0, 2) + "% err=" +
-    String(res.errorFrac * 100.0, 3) + "% (" + res.probes + " probes)");
-  } else {
-    Serial.println((String)"[PW_CENTER_FAIL] ch=" + pwCh + " keeping previous=" + PW_CENTER[pwCh]);
-    apply_pw_baseline(pwCh); // Make sure hardware is left in a safe state even on fail
+    PW_CENTER[ch] = res.pw;
+    PW_CAL_LIMITS[ch][1].center = res.pw;
+    update_FS_PW_Channel(ch);
+    apply_pw_baseline(ch);
   }
 }
-// High-level PW Low/High Limit Search
+
+// High-level Single-Point Limit Entry Point (Fallback / Standalone UI wrapper)
 void find_PW_limit_v2(PWLimitDir dir) {
-  // Use 440 Hz anchor for high-speed limit detection
-  uint8_t note = manual_cal_reference_note;
-  DCO_calibration_current_note = note;
-  VOICE_NOTES[0] = note;
+  uint8_t osc = currentDCO;
+  uint8_t ch  = cal_pw_channel(osc);
+  if (PW_PINS[ch] == PW_PIN_UNASSIGNED) return;
 
-  const uint8_t pwCh = cal_pw_channel(currentDCO);
-  if (PW_PINS[pwCh] == PW_PIN_UNASSIGNED) return;
+  uint16_t amp = ampComp440[osc];
+  if (amp < 500) amp = (uint16_t)(DIV_COUNTER / 4);
 
-  DCOCalibrationStart = millis();
+  write_range_pwm(osc, amp);
+  autotune_drive_core(osc, 440.0f, amp);
 
-  // Retrieve the strong 440 Hz amplitude
-  uint16_t amp = ampComp440[currentDCO];
-  if (amp < 500) {
-    amp = (uint16_t)(DIV_COUNTER / 4);
-  }
-  ampCompCalibrationVal = amp;
+  const CalPrecisionProfile &prec = cal_precision();
+  double targetDuty = (dir == PW_LIMIT_LOW) ? kPWLowDutyFraction : kPWHighDutyFraction;
+  uint16_t center = PW_CENTER[ch];
 
-  // Force the hardware to the new 440Hz frequency and amplitude
-  write_range_pwm(currentDCO, amp);
-  autotune_drive_core(currentDCO, (float)note_to_freq(note), amp);
+  uint16_t minPW = (dir == PW_LIMIT_LOW) ? 0 : center;
+  uint16_t maxPW = (dir == PW_LIMIT_LOW) ? center : DIV_COUNTER_PW;
+  uint16_t seedPW = (dir == PW_LIMIT_LOW) ? (center * 0.15) : (center + (DIV_COUNTER_PW - center) * 0.85);
 
-  double freqHz   = (double)note_to_freq(note);
-  uint16_t center = PW_CENTER[pwCh];
-
-  double   targetDuty = (dir == PW_LIMIT_LOW) ? kPWLowDutyFraction  : kPWHighDutyFraction;  // 2% or 98%
-  
-  // --> FIXED: Dynamically adapt the search bounds so Half-Modes can scan the whole range
-  uint16_t minPW, maxPW, seedPW;
-  if (pwSweepMode == PW_SWEEP_FULL) {
-    minPW  = (dir == PW_LIMIT_LOW) ? 0                   : center;
-    maxPW  = (dir == PW_LIMIT_LOW) ? center              : DIV_COUNTER_PW;
-    seedPW = (dir == PW_LIMIT_LOW) ? (center * 0.15)     : (center + (DIV_COUNTER_PW - center) * 0.85);
-  } else {
-    // For Half modes, the limit lives somewhere across the entire physical range.
-    // Seed away from the center to find the pulse limit faster.
-    minPW  = 0;
-    maxPW  = DIV_COUNTER_PW;
-    seedPW = (center < DIV_COUNTER_PW / 2) ? (DIV_COUNTER_PW * 0.85) : (DIV_COUNTER_PW * 0.15);
-  }
-
-  const char *tag = (dir == PW_LIMIT_LOW) ? "PW_LOW" : "PW_HIGH";
-  Serial.println((String)"[" + tag + "_START] DCO=" + currentDCO + " ch=" + pwCh +
-  " target=" + String(targetDuty * 100.0, 1) + "% anchorAmp=" + amp);
-
-  PWSearchResult res = find_pw_for_target_duty(
-    pwCh,
-    targetDuty,
-    kPWLimitDutyTolerance, // ±1%
-    minPW,
-    maxPW,
-    seedPW,
-    freqHz
-  );
-
-  if (calibrationCancelRequested) return;
-
-  uint16_t finalLimitPW = res.ok ? res.pw : (dir == PW_LIMIT_LOW ? PW_LOW_LIMIT[pwCh] : PW_HIGH_LIMIT[pwCh]);
-
+  PWSearchResult res = find_pw_for_target_duty(ch, targetDuty, prec.pwDutyTol, minPW, maxPW, seedPW, 440.0);
   if (res.ok) {
     if (dir == PW_LIMIT_LOW) {
-      PW_LOW_LIMIT[pwCh] = res.pw;
-      update_FS_PW_Low_Limit(pwCh, res.pw);
-      g_pwSummary[pwCh].pwLow   = res.pw;
-      g_pwSummary[pwCh].lowDuty = res.duty;
+      PW_LOW_LIMIT[ch] = res.pw;
+      PW_CAL_LIMITS[ch][1].lowLimit = res.pw;
     } else {
-      PW_HIGH_LIMIT[pwCh] = res.pw;
-      update_FS_PW_High_Limit(pwCh, res.pw);
-      g_pwSummary[pwCh].pwHigh   = res.pw;
-      g_pwSummary[pwCh].highDuty = res.duty;
+      PW_HIGH_LIMIT[ch] = res.pw;
+      PW_CAL_LIMITS[ch][1].highLimit = res.pw;
     }
-
-    Serial.println((String)"[" + tag + "_RESULT] ch=" + pwCh + " LIMIT=" + res.pw +
-    " duty=" + String(res.duty * 100.0, 2) + "% (" + res.probes + " probes)");
+    update_FS_PW_Channel(ch);
   }
-
-  // Restore center after sweep
-  // --> FIXED: Use apply_pw_baseline instead of apply_pw_center so we don't accidentally clamp to 512
-  apply_pw_baseline(pwCh); 
+  apply_pw_baseline(ch);
 }
 
 // =============================================================================
@@ -1101,10 +1162,10 @@ static void print_multi_osc_summary_table(uint8_t scope, uint8_t precision, uint
 // Print dedicated PW-only summary table
 static void print_pw_summary_table() {
   Serial.println("\n======================================================================================================================");
-  Serial.println((String)"[PW_SUMMARY] FINAL PULSE-WIDTH (PW) CALIBRATION REPORT (Mode: " +
-                 pw_sweep_mode_name(pwSweepMode) + " | Ref: 440.0 Hz)");
+  Serial.println((String)"[PW_SUMMARY] FINAL 3-POINT PULSE-WIDTH (PW) CALIBRATION REPORT (Mode: " +
+                 pw_sweep_mode_name(pwSweepMode) + ")");
   Serial.println("======================================================================================================================");
-  Serial.println(" Ch | Pin  | Oscs  | Status |   PW_CENTER (Duty)   |    PW_LOW (Duty)     |    PW_HIGH (Duty)    | Span | Probes | Time ");
+  Serial.println(" Ch | Pin  | Oscs  | Status |  PW_CENTER [440Hz]   |    PW_LOW [440Hz]    |   PW_HIGH [440Hz]    | Span | Probes | Time ");
   Serial.println("----+------+-------+--------+----------------------+----------------------+----------------------+------+--------+------");
 
   int successCount = 0;
@@ -1302,7 +1363,7 @@ void run_pw_cv_probe() {
     if (calibrationCancelRequested) break;
   }
 
-  apply_pw_center(expectCh);
+  apply_pw_baseline(expectCh);
 }
 
 void DCO_calibration_debug() {
@@ -1325,7 +1386,6 @@ void DCO_calibration_debug() {
   if (autotuneDebug >= 1 && gm.timedOut) cal_sense_probe_log();
   serialSendParam32(PARAM_GAP_FROM_DCO, (uint32_t)dutyErrorPercentTimes100, true);
 }
-
 
 // =============================================================================
 // Master Auto-Calibration Entry Point
@@ -1390,6 +1450,7 @@ void DCO_calibration() {
     Serial.println((String)"  DCO " + i + ": ampComp440=" + ampComp440[i] +
     " | manualOffset=" + manualCalibrationOffset[i] +
     " | dutyOffset=" + ampCompDutyOffset[i] +
+    " | topPair=" + ampCompTopPair[i] +
     " | PW_CENTER[ch " + ch + "]=" + PW_CENTER[ch] +
     " | PW_LOW=" + PW_LOW_LIMIT[ch] + " | PW_HIGH=" + PW_HIGH_LIMIT[ch]);
   }
@@ -1405,75 +1466,7 @@ void DCO_calibration() {
   bool allSucceeded    = true;
 
   // ---------------------------------------------------------------------------
-  // 1. PW Calibration Stage
-  // ---------------------------------------------------------------------------
-  if (runPW && !calibrationCancelRequested) {
-    Serial.println((String)"\n[DCO_CAL] ---> Starting PW Calibration Stage (Mode: " +
-                   pw_sweep_mode_name(pwSweepMode) + ")");
-    uint8_t lastCh = 0xFF;
-    for (uint8_t osc = 0; osc < NUM_OSCILLATORS; ++osc) {
-      if (calibrationCancelRequested) break;
-      if (!osc_has_pw(osc)) continue;
-
-      const uint8_t ch = cal_pw_channel(osc);
-      if (ch == lastCh || PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
-      lastCh = ch;
-      currentDCO = osc;
-
-      g_pwSummary[ch].attempted = true;
-      uint32_t pwChStartMs = millis();
-      int probesBefore = calRunProbes;
-
-      Serial.println((String)"\n[DCO_CAL] Calibrating PW for Channel " + ch + " (Osc " + osc + ")");
-      restart_DCO_calibration();
-      DCO_calibration_current_note = manual_cal_reference_note;
-      VOICE_NOTES[0] = DCO_calibration_current_note;
-
-      // 1. Always find physical 50% center
-      find_PW_center(0);
-
-      // 2. Low Limit Search (or duplicate Center)
-      if (pwSweepMode == PW_SWEEP_FULL || pwSweepMode == PW_SWEEP_HALF_LOW) {
-        if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_LOW);
-      } else {
-        // Half-High: Low limit does not exist, duplicate Center
-        PW_LOW_LIMIT[ch] = PW_CENTER[ch];
-        update_FS_PW_Low_Limit(ch, PW_CENTER[ch]);
-        g_pwSummary[ch].pwLow   = PW_CENTER[ch];
-        g_pwSummary[ch].lowDuty = g_pwSummary[ch].centerDuty;
-        Serial.println((String)"  [PW_LOW] Skipped (HALF_HIGH mode) -> Cloned PW_CENTER=" + PW_CENTER[ch]);
-      }
-
-      // 3. High Limit Search (or duplicate Center)
-      if (pwSweepMode == PW_SWEEP_FULL || pwSweepMode == PW_SWEEP_HALF_HIGH) {
-        if (!calibrationCancelRequested) find_PW_limit_v2(PW_LIMIT_HIGH);
-      } else {
-        // Half-Low: High limit does not exist, duplicate Center
-        PW_HIGH_LIMIT[ch] = PW_CENTER[ch];
-        update_FS_PW_High_Limit(ch, PW_CENTER[ch]);
-        g_pwSummary[ch].pwHigh   = PW_CENTER[ch];
-        g_pwSummary[ch].highDuty = g_pwSummary[ch].centerDuty;
-        Serial.println((String)"  [PW_HIGH] Skipped (HALF_LOW mode) -> Cloned PW_CENTER=" + PW_CENTER[ch]);
-      }
-
-      g_pwSummary[ch].pwCenter  = PW_CENTER[ch];
-      g_pwSummary[ch].pwLow     = PW_LOW_LIMIT[ch];
-      g_pwSummary[ch].pwHigh    = PW_HIGH_LIMIT[ch];
-      g_pwSummary[ch].probes    = calRunProbes - probesBefore;
-      g_pwSummary[ch].elapsedMs = millis() - pwChStartMs;
-
-      if (calibrationCancelRequested) {
-        g_pwSummary[ch].cancelled = true;
-        allSucceeded = false;
-        break;
-      }
-
-      g_pwSummary[ch].ok = true;
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // 2. Amp Compensation Calibration Stage
+  // 1. Amp Compensation Calibration Stage (Runs FIRST in Full Mode)
   // ---------------------------------------------------------------------------
   if (runAmp && !calibrationCancelRequested) {
     Serial.println("\n[DCO_CAL] ---> Starting Amp Compensation Stage");
@@ -1516,7 +1509,7 @@ void DCO_calibration() {
         }
       }
 
-      // Compute statistics for summary table
+      // Compute statistics for summary table & find top valid pair
       float errSum = 0.0f, worstErr = 0.0f, worstHz = 0.0f;
       int   errCount = 0, highestPair = 0, worstPair = -1;
 
@@ -1557,9 +1550,11 @@ void DCO_calibration() {
 
       if (tableOk) {
         g_oscSummary[i].ok = true;
+        // Save table and persist the top valid pair index for 3-Point PW tuning
+        update_FS_AmpCompTopPair(currentDCO, (uint8_t)highestPair);
         update_FS_voice(currentDCO);
         anyTableUpdated = true;
-        Serial.println((String)"[DCO_CAL] DCO " + currentDCO + " table successfully saved to filesystem.");
+        Serial.println((String)"[DCO_CAL] DCO " + currentDCO + " table saved (TopPair=" + highestPair + ").");
       } else {
         g_oscSummary[i].ok = false;
         allSucceeded = false;
@@ -1571,14 +1566,40 @@ void DCO_calibration() {
   }
 
   // ---------------------------------------------------------------------------
+  // 2. 3-Point PW Calibration Stage (Runs SECOND using verified points)
+  // ---------------------------------------------------------------------------
+  if (runPW && !calibrationCancelRequested) {
+    Serial.println((String)"\n[DCO_CAL] ---> Starting 3-Point PW Calibration Stage (Mode: " +
+                   pw_sweep_mode_name(pwSweepMode) + ")");
+    uint8_t lastCh = 0xFF;
+    for (uint8_t osc = 0; osc < NUM_OSCILLATORS; ++osc) {
+      if (calibrationCancelRequested) break;
+      if (!osc_has_pw(osc)) continue;
+
+      const uint8_t ch = cal_pw_channel(osc);
+      if (ch == lastCh || PW_PINS[ch] == PW_PIN_UNASSIGNED) continue;
+      lastCh = ch;
+      currentDCO = osc;
+
+      restart_DCO_calibration();
+      calibrate_pw_channel_3point(ch, osc);
+
+      if (calibrationCancelRequested) {
+        allSucceeded = false;
+        break;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // 3. Final Summary Report Selection
   // ---------------------------------------------------------------------------
   if (scope == CAL_SCOPE_PW) {
-    print_pw_summary_table(); // Specific report for PW-only calibration
+    print_pw_summary_table();
   } else if (scope == CAL_SCOPE_AMP) {
-    print_multi_osc_summary_table(scope, calibrationPrecision, autotuneAmpMethod); // Amp report
+    print_multi_osc_summary_table(scope, calibrationPrecision, autotuneAmpMethod);
   } else {
-    // FULL run: print both PW and Multi-Oscillator reports
+    // FULL run: print both PW and Multi-Oscillator summary reports
     print_pw_summary_table();
     print_multi_osc_summary_table(scope, calibrationPrecision, autotuneAmpMethod);
   }
@@ -1613,11 +1634,11 @@ void DCO_calibration() {
   Serial.println("[DCO_CAL] Rebooting Pi Pico for clean polyphonic engine startup...");
   Serial.flush();
 
-  // 2. Short delay to allow Serial/UART DMA to finish transmitting packets
+  // Short delay to allow Serial/UART DMA to finish transmitting packets
   delay(1000);
 
   if (allSucceeded) {
-    // 3. Trigger clean hardware warm-reboot of both RP2040 cores
+    // Trigger clean hardware warm-reboot of both RP2040 cores
     watchdog_reboot(0, 0, 0);
     while (true) {
       tight_loop_contents();

@@ -4,18 +4,22 @@
 #include <stdint.h>
 
 // =============================================================================
-// Autotune Hardware & Measurement Constants
+// Edge Timing & Dynamic Debounce Constants
 // =============================================================================
 
 // Sentinel value returned by gap-measurement routines on timeout / invalid read.
 constexpr float   kGapTimeoutSentinel             = 1.16999f;
 constexpr int32_t kManualGapTimeoutDutyErrTimes100 = 99999;
 
-// Edge timing limits & debouncing (microseconds)
+// Edge timing limits
 constexpr unsigned long kGapTimeoutUs      = 100000UL;  // 100 ms baseline timeout
 constexpr unsigned long kGapTimeoutMaxUs   = 400000UL;  // 400 ms ceiling at ultra-low freq
 constexpr double        kGapTimeoutPeriods = 2.5;       // Period multiple for timeout deadline
-constexpr unsigned long kEdgeDebounceMinUs = 20UL;      // Minimum edge interval debounce
+
+// Dynamic Edge Debouncing
+constexpr double        kEdgeDebouncePeriodFraction = 0.005;  // 0.5% of waveform period
+constexpr unsigned long kEdgeDebounceFloorUs        = 1UL;    // 1 µs absolute floor at high frequencies
+constexpr unsigned long kEdgeDebounceCeilUs         = 25UL;   // 25 µs ceiling at low frequencies
 
 // Sampling segment counts
 constexpr uint16_t kGapSamplesDefault    = 6;
@@ -29,83 +33,101 @@ constexpr bool kGapPolarityInverted = false;    // Set true if cal pin is invert
 // Precision Profiles (NORMAL, FINE, FAST)
 // =============================================================================
 
+// =============================================================================
+// Precision Profiles (NORMAL, FINE, FAST)
+// =============================================================================
+
 struct CalPrecisionProfile {
-  uint16_t gapSamplesMin;     // find_gap modes 2/3: min averaged segments
-  uint16_t gapSamplesMax;     // max averaged segments
-  uint32_t gapWindowMs;       // target measurement duration window
-  uint32_t gapMaxWindowMs;    // ceiling on duration for ultra-low frequencies
-  float    settlePeriods;     // wait time in waveform periods after freq write
-  uint16_t settleMinMs;       // floored settle time in milliseconds
-  double   bisectDutyTol;     // search duty acceptance fraction (e.g. 0.0005 = 0.05%)
-  double   bisectGapFloorUs;  // floored microsecond gap tolerance
-  int      bisectIters;       // probe budget per search
-  int      bisectWindows;     // search reach multiplier
-  int      confirmReads;      // readings averaged at converged point
-  int      confirmRounds;     // allowed correction rounds if confirm misses
-  int      anchorTries;       // FREQ_TRACE 440 Hz anchor corrections
-  int      rungRetries;       // FREQ_TRACE per-rung corrections
-  uint8_t  settleMaxChecks;   // stability checks on large moves
-  float    settleStableMult;  // multiplier * tolerance for settled condition
+  uint16_t gapSamplesMin;       // find_gap modes 2/3: min averaged segments
+  uint16_t gapSamplesMax;       // max averaged segments
+  uint32_t gapWindowMs;         // target measurement duration window
+  uint32_t gapMaxWindowMs;      // ceiling on duration for ultra-low frequencies
+  float    settlePeriods;       // wait time in waveform periods after freq write
+  uint16_t settleMinMs;         // floored settle time in milliseconds
+  double   bisectDutyTol;       // search duty acceptance fraction (e.g. 0.0005 = 0.05%)
+  double   bisectGapFloorUs;    // floored microsecond gap tolerance
+  int      bisectIters;         // probe budget per search
+  int      bisectWindows;       // search reach multiplier
+  int      confirmReads;        // readings averaged at converged point
+  int      confirmRounds;       // allowed correction rounds if confirm misses
+  int      anchorTries;         // FREQ_TRACE 440 Hz anchor corrections
+  int      rungRetries;         // FREQ_TRACE per-rung corrections
+  uint8_t  settleMaxChecks;     // stability checks on large moves
+  float    settleStableMult;    // multiplier * tolerance for settled condition
+
+  // --- Pulse Width (PW) Precision Profile Fields ---
+  double   pwDutyTol;           // PW target duty tolerance (e.g. 0.01 = 1.0%)
+  uint8_t  pwConfirmReads;      // Number of reads averaged during confirmation & neighborhood sweep
+  bool     pwNeighborhoodSweep; // Enable 5-point local neighborhood refinement (±2 counts)
 };
 
-// Fast build: for rapid testing tables
+// Fast build: rapid testing tables (PW tolerance = 1.0%)
 constexpr CalPrecisionProfile kCalPrecisionFast = {
-  /* gapSamplesMin    */ 4,
-  /* gapSamplesMax    */ 32,
-  /* gapWindowMs      */ 12,
-  /* gapMaxWindowMs   */ 200,
-  /* settlePeriods    */ 1.0f,
-  /* settleMinMs      */ 2,
-  /* bisectDutyTol    */ 0.0010,
-  /* bisectGapFloorUs */ 1.0,
-  /* bisectIters      */ 16,
-  /* bisectWindows    */ 2,
-  /* confirmReads     */ 1,
-  /* confirmRounds    */ 1,
-  /* anchorTries      */ 1,
-  /* rungRetries      */ 0,
-  /* settleMaxChecks  */ 1,
-  /* settleStableMult */ 4.0f,
+  /* gapSamplesMin       */ 4,
+  /* gapSamplesMax       */ 32,
+  /* gapWindowMs         */ 12,
+  /* gapMaxWindowMs      */ 200,
+  /* settlePeriods       */ 1.0f,
+  /* settleMinMs         */ 2,
+  /* bisectDutyTol       */ 0.0010,
+  /* bisectGapFloorUs    */ 1.0,
+  /* bisectIters         */ 16,
+  /* bisectWindows       */ 2,
+  /* confirmReads        */ 1,
+  /* confirmRounds       */ 1,
+  /* anchorTries         */ 1,
+  /* rungRetries         */ 0,
+  /* settleMaxChecks     */ 1,
+  /* settleStableMult    */ 4.0f,
+  /* pwDutyTol           */ 0.010,  // ±1.0% duty tolerance (FAST)
+  /* pwConfirmReads      */ 1,      // 1-shot confirmation
+  /* pwNeighborhoodSweep */ false,  // Skip Stage 2 for rapid execution
 };
 
 // Normal build: scratch build balanced for speed & accuracy
 constexpr CalPrecisionProfile kCalPrecisionNormal = {
-  /* gapSamplesMin    */ 6,
-  /* gapSamplesMax    */ 64,
-  /* gapWindowMs      */ 25,
-  /* gapMaxWindowMs   */ 300,
-  /* settlePeriods    */ 1.0f,
-  /* settleMinMs      */ 3,
-  /* bisectDutyTol    */ 0.0005,
-  /* bisectGapFloorUs */ 0.5,
-  /* bisectIters      */ 24,
-  /* bisectWindows    */ 2,
-  /* confirmReads     */ 2,
-  /* confirmRounds    */ 2,
-  /* anchorTries      */ 2,
-  /* rungRetries      */ 1,
-  /* settleMaxChecks  */ 1,
-  /* settleStableMult */ 3.0f,
+  /* gapSamplesMin       */ 6,
+  /* gapSamplesMax       */ 64,
+  /* gapWindowMs         */ 25,
+  /* gapMaxWindowMs      */ 300,
+  /* settlePeriods       */ 1.0f,
+  /* settleMinMs         */ 3,
+  /* bisectDutyTol       */ 0.0005,
+  /* bisectGapFloorUs    */ 0.5,
+  /* bisectIters         */ 24,
+  /* bisectWindows       */ 2,
+  /* confirmReads        */ 2,
+  /* confirmRounds       */ 2,
+  /* anchorTries         */ 2,
+  /* rungRetries         */ 1,
+  /* settleMaxChecks     */ 1,
+  /* settleStableMult    */ 3.0f,
+  /* pwDutyTol           */ 0.0025, // ±0.25% duty tolerance (NORMAL)
+  /* pwConfirmReads      */ 2,      // 2-read confirmation
+  /* pwNeighborhoodSweep */ true,   // Full 5-point sweep
 };
 
 // Fine build: highest quality refinement / verification pass
 constexpr CalPrecisionProfile kCalPrecisionFine = {
-  /* gapSamplesMin    */ 12,
-  /* gapSamplesMax    */ 256,
-  /* gapWindowMs      */ 60,
-  /* gapMaxWindowMs   */ 300,
-  /* settlePeriods    */ 1.0f,
-  /* settleMinMs      */ 4,
-  /* bisectDutyTol    */ 0.0002,
-  /* bisectGapFloorUs */ 0.25,
-  /* bisectIters      */ 32,
-  /* bisectWindows    */ 3,
-  /* confirmReads     */ 5,
-  /* confirmRounds    */ 2,
-  /* anchorTries      */ 3,
-  /* rungRetries      */ 1,
-  /* settleMaxChecks  */ 3,
-  /* settleStableMult */ 2.0f,
+  /* gapSamplesMin       */ 12,
+  /* gapSamplesMax       */ 256,
+  /* gapWindowMs         */ 60,
+  /* gapMaxWindowMs      */ 300,
+  /* settlePeriods       */ 1.0f,
+  /* settleMinMs         */ 4,
+  /* bisectDutyTol       */ 0.0002,
+  /* bisectGapFloorUs    */ 0.25,
+  /* bisectIters         */ 32,
+  /* bisectWindows       */ 3,
+  /* confirmReads        */ 5,
+  /* confirmRounds       */ 2,
+  /* anchorTries         */ 3,
+  /* rungRetries         */ 1,
+  /* settleMaxChecks     */ 3,
+  /* settleStableMult    */ 2.0f,
+  /* pwDutyTol           */ 0.0010, // ±0.10% duty tolerance (REFINE)
+  /* pwConfirmReads      */ 5,      // 5-read deep confirmation
+  /* pwNeighborhoodSweep */ true,   // Full 5-point sweep
 };
 
 // =============================================================================

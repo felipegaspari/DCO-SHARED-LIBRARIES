@@ -351,6 +351,8 @@ static inline void precompute_amp_comp_for_engine() {
   precomputeCoefficients(true);
 #endif
   for (int o = 0; o < NUM_OSCILLATORS; ++o) ampWinCache[o] = -1;
+
+  precompute_pw_tracking_cache();
 }
 
 // ---------------------------------------------------------------------------

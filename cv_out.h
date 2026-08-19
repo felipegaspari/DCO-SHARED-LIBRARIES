@@ -12,9 +12,9 @@ void update_CV_outs();
 void update_CV_outs_manual_calibration();
 
 // Bake CV mod depth scales (call after the matching depth global changes).
-void cv_bake_adsr2_to_vcf_scale();
-void cv_bake_lfo2_to_vcf_scale();
-void cv_bake_lfo1_to_vca_scale();
+void __not_in_flash_func(cv_bake_adsr2_to_vcf_scale)();
+void __not_in_flash_func(cv_bake_lfo2_to_vcf_scale)();
+void __not_in_flash_func(cv_bake_lfo1_to_vca_scale)();
 void cv_update_mod_scales();  // all three (boot)
 
 #endif

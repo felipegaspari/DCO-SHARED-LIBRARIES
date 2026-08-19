@@ -94,6 +94,25 @@ uint16_t linearToLogarithmic(uint16_t linearValue, float base, uint16_t maxValue
     return expValOut;
   }
   
+  // =============================================================================
+// Fast Math Helpers (Replaces expConverterFloat)
+// =============================================================================
+
+// Replaces: expConverterFloat(v, 5000)
+// Uses multiply by reciprocal (1.0f / 5000.0f = 0.0002f)
+// v^2 / 5000 < 0.005 equates to v <= 4
+static inline float fast_exp_speed_5000(uint32_t v) {
+  if (v <= 4) return 0.0f;
+  return (float)(v * v) * 0.0002f;
+}
+
+// Replaces: expConverterFloat(v, 500) / 275000.0f
+// 1.0f / (500.0f * 275000.0f) = 7.27272727e-9f
+// v^2 / 500 < 0.005 equates to v <= 1
+static inline float fast_lfo_depth_amt(uint32_t v) {
+  if (v <= 1) return 0.0f;
+  return (float)(v * v) * 7.27272727e-9f;
+}
   
 
 #endif

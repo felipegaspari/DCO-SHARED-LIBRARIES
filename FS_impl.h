@@ -2,34 +2,139 @@
 // writers and the fake-calibration seed. Include exactly once, from the
 // sketch's DCO/FS.ino shim. Declarations: FS.h. Format and the rules for
 // changing any of it: docs/CALIBRATION_STORAGE.md.
-//
-// The on-flash byte layout is fixed — bank sizes are compile-time constants
-// that preset bulk restore, the host cal dump and this loader each derive
-// independently, so a size change silently breaks stored calibration.
+
 #ifndef __FS_IMPL_H__
 #define __FS_IMPL_H__
 
 #include "../include_all.h"
 
-// Pack one uint16 little-endian into a PW bank buffer at voiceN * 2.
-static void pack_pw_u16(uint8_t* bank, uint8_t voiceN, uint16_t value) {
-  bank[voiceN * FSPWDataSize + 0] = (uint8_t)(value & 0xFF);
-  bank[voiceN * FSPWDataSize + 1] = (uint8_t)((value >> 8) & 0xFF);
+// =============================================================================
+// Buffer & RAM Array Instantiations
+// =============================================================================
+uint8_t voiceTablesBankBuffer[FSBankSize];
+uint8_t PWCalBankBuffer[FSPWBankSize];
+uint8_t AmpCompTopPairBankBuffer[FSAmpCompTopPairBankSize];
+uint8_t ManualOffsetBankBuffer[FSManualOffsetBankSize];
+uint8_t AmpComp440BankBuffer[FSAmpComp440BankSize];
+uint8_t AmpCompDutyOffsetBankBuffer[FSAmpCompDutyOffsetBankSize];
+
+File fileVoiceTablesFS;
+File filePWCalFS;
+File fileAmpCompTopPairFS;
+File fileManualOffsetFS;
+File fileAmpComp440FS;
+File fileAmpCompDutyOffsetFS;
+
+// Global RAM Definitions for 3-Point PW & Amp-Comp Tracking
+PWCalLimits  PW_CAL_LIMITS[NUM_PW_CHANNELS][3]; // [Channel][0=Low, 1=Mid, 2=High]
+uint8_t      ampCompTopPair[NUM_OSCILLATORS];
+PWTrackCache pwTrackCache[NUM_PW_CHANNELS];
+
+// =============================================================================
+// Low-Level Byte Serialization Helpers (Pure Integer 6-Byte Point)
+// =============================================================================
+
+// Pack a 6-byte PW point: [center: 2B, lowLimit: 2B, highLimit: 2B]
+static void pack_pw_limits_point(uint8_t* bank, uint8_t ch, uint8_t pt, const PWCalLimits& p) {
+  uint16_t offset = (ch * FSPWDataSize) + (pt * FSPWLimitsPointDataSize);
+
+  bank[offset + 0] = (uint8_t)(p.center & 0xFF);
+  bank[offset + 1] = (uint8_t)((p.center >> 8) & 0xFF);
+  bank[offset + 2] = (uint8_t)(p.lowLimit & 0xFF);
+  bank[offset + 3] = (uint8_t)((p.lowLimit >> 8) & 0xFF);
+  bank[offset + 4] = (uint8_t)(p.highLimit & 0xFF);
+  bank[offset + 5] = (uint8_t)((p.highLimit >> 8) & 0xFF);
 }
 
+// Unpack a 6-byte PW point
+static PWCalLimits unpack_pw_limits_point(const uint8_t* bank, uint8_t ch, uint8_t pt) {
+  uint16_t offset = (ch * FSPWDataSize) + (pt * FSPWLimitsPointDataSize);
+  PWCalLimits p;
+
+  p.center    = (uint16_t)bank[offset + 0] | ((uint16_t)bank[offset + 1] << 8);
+  p.lowLimit  = (uint16_t)bank[offset + 2] | ((uint16_t)bank[offset + 3] << 8);
+  p.highLimit = (uint16_t)bank[offset + 4] | ((uint16_t)bank[offset + 5] << 8);
+
+  return p;
+}
+
+// Precompute frequency boundaries and Q31/Float reciprocal multipliers
+void precompute_pw_tracking_cache() {
+  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    uint8_t osc = ch * (NUM_OSCILLATORS / NUM_PW_CHANNELS);
+
+    // 1. Determine the 3 operating rung indices from the Amp-Comp curve
+    uint8_t topIdx = ampCompTopPair[osc];
+    if (topIdx < 6 || topIdx >= (chanLevelVoiceDataSize / 2)) {
+      topIdx = 18;
+    }
+
+    int anchorIdx = (calReportAnchorPair >= 0) ? calReportAnchorPair : 10;
+    int lowIdx    = max(2, anchorIdx - 5);            // Point 0 (LOW: ~100 Hz)
+    int midIdx    = anchorIdx;                        // Point 1 (MID: ~440 Hz Anchor)
+    int highIdx   = max(midIdx + 2, (int)topIdx - 2); // Point 2 (HIGH: TopPair - 2)
+
+    // =======================================================================
+    // A. FLOAT ENGINE PRECOMPUTE (RP2350 / FPU)
+    // =======================================================================
+#ifdef USE_FLOAT_VOICE_TASK
+    float f0 = ampCompFrequencyHz[osc][lowIdx];
+    float f1 = ampCompFrequencyHz[osc][midIdx];
+    float f2 = ampCompFrequencyHz[osc][highIdx];
+
+    if (f0 <= 0.0f) f0 = 110.0f;
+    if (f1 <= f0)   f1 = 440.0f;
+    if (f2 <= f1)   f2 = 2800.0f;
+
+    pwTrackCache[ch].f0 = f0;
+    pwTrackCache[ch].f1 = f1;
+    pwTrackCache[ch].f2 = f2;
+    pwTrackCache[ch].invSpan01 = 1.0f / (f1 - f0);
+    pwTrackCache[ch].invSpan12 = 1.0f / (f2 - f1);
+
+    // =======================================================================
+    // B. FIXED-POINT Q31 PRECOMPUTE (RP2040 Default - Zero Underflow)
+    // =======================================================================
+#else
+    uint32_t f0 = (uint32_t)ampCompFrequencyArray[osc][lowIdx];
+    uint32_t f1 = (uint32_t)ampCompFrequencyArray[osc][midIdx];
+    uint32_t f2 = (uint32_t)ampCompFrequencyArray[osc][highIdx];
+
+    if (f0 == 0) f0 = (uint32_t)(110ULL << FREQ_FRAC_BITS);
+    if (f1 <= f0) f1 = (uint32_t)(440ULL << FREQ_FRAC_BITS);
+    if (f2 <= f1) f2 = (uint32_t)(2800ULL << FREQ_FRAC_BITS);
+
+    pwTrackCache[ch].f0 = f0;
+    pwTrackCache[ch].f1 = f1;
+    pwTrackCache[ch].f2 = f2;
+
+    uint32_t span01 = f1 - f0;
+    uint32_t span12 = f2 - f1;
+
+    // Q31 Reciprocal Multipliers (Prevents underflow, enables single-cycle integer MAC)
+    pwTrackCache[ch].invSpan01_q24 = (span01 > 0) ? (uint32_t)((1ULL << 31) / span01) : 0;
+    pwTrackCache[ch].invSpan12_q24 = (span12 > 0) ? (uint32_t)((1ULL << 31) / span12) : 0;
+#endif
+  }
+}
 
 #if PROJECT_INSTRUMENT == 4
 static void ensure_pw_fs_banks();
 #endif
 
-// Mount LittleFS and load amp-comp / PW / offset calibration into runtime arrays (float or Q8).
-// Called from setup1() and again at end of DCO_calibration().
+// =============================================================================
+// Primary LittleFS Initializer & Runtime Loader
+// =============================================================================
+
 void init_FS() {
   LittleFS.begin();
 
+  // =========================================================================
+  // 1. VOICE TABLES (Amp Compensation)
+  // =========================================================================
   if (!LittleFS.exists("voiceTables")) {
     fileVoiceTablesFS = LittleFS.open("voiceTables", "w+");
-    memset(voiceTablesBankBuffer, 0, FSBankSize); // Safely initialize empty tables
+    memset(voiceTablesBankBuffer, 0, FSBankSize);
     fileVoiceTablesFS.write(voiceTablesBankBuffer, FSBankSize);
   } else {
     fileVoiceTablesFS = LittleFS.open("voiceTables", "r");
@@ -38,101 +143,95 @@ void init_FS() {
   fileVoiceTablesFS.close();
 
 #ifdef ENABLE_FS_CALIBRATION
-
-  fileVoiceTablesFS.read(voiceTablesBankBuffer, FSBankSize);
-  fileVoiceTablesFS.close();
-
-
-    for (int i = 0; i < (chanLevelVoiceDataSize * NUM_OSCILLATORS); i++) {
-     freq_to_amp_comp_array[i] = (int32_t(voiceTablesBankBuffer[i * 4 + 3]) << 24) |
-                    (int32_t(voiceTablesBankBuffer[i * 4 + 2]) << 16) |
-                    (int32_t(voiceTablesBankBuffer[i * 4 + 1]) << 8) |
-                    int32_t(voiceTablesBankBuffer[i * 4 ]);
+  for (int i = 0; i < (chanLevelVoiceDataSize * NUM_OSCILLATORS); i++) {
+    freq_to_amp_comp_array[i] = (int32_t(voiceTablesBankBuffer[i * 4 + 3]) << 24) |
+                                (int32_t(voiceTablesBankBuffer[i * 4 + 2]) << 16) |
+                                (int32_t(voiceTablesBankBuffer[i * 4 + 1]) << 8)  |
+                                 int32_t(voiceTablesBankBuffer[i * 4]);
   }
 
-    for (int datasetIndex = 0; datasetIndex < NUM_OSCILLATORS; ++datasetIndex) {
-        for (int pairIndex = 0; pairIndex < chanLevelVoiceDataSize / 2; ++pairIndex) {
-            int rawIndex = datasetIndex * chanLevelVoiceDataSize + pairIndex * 2;
+  for (int datasetIndex = 0; datasetIndex < NUM_OSCILLATORS; ++datasetIndex) {
+    for (int pairIndex = 0; pairIndex < chanLevelVoiceDataSize / 2; ++pairIndex) {
+      int rawIndex = datasetIndex * chanLevelVoiceDataSize + pairIndex * 2;
+      int32_t freq_x100 = freq_to_amp_comp_array[rawIndex];
 
-        // Stored frequencies are in Hz*100.
-            int32_t freq_x100 = freq_to_amp_comp_array[rawIndex];
-
-        ampCompArray[datasetIndex][pairIndex] = freq_to_amp_comp_array[rawIndex + 1];
+      ampCompArray[datasetIndex][pairIndex] = freq_to_amp_comp_array[rawIndex + 1];
 
 #ifdef USE_FLOAT_AMP_COMP
-        // Float engine: Hz table for FLOAT_QUAD / LUT; Q8 also seeded at precompute for FIXED.
-        float freqHz = (float)freq_x100 / 100.0f;
-        ampCompFrequencyHz[datasetIndex][pairIndex] = freqHz;
+      float freqHz = (float)freq_x100 / 100.0f;
+      ampCompFrequencyHz[datasetIndex][pairIndex] = freqHz;
 #else
-        // Fixed-point engine: convert to fixed-point Hz (Hz * 2^FREQ_FRAC_BITS).
-        int64_t scaled = (int64_t)freq_x100 * (1LL << FREQ_FRAC_BITS);
-        int32_t freq_fx = (scaled >= 0)
-                        ? (int32_t)((scaled + 50LL) / 100LL)
-                        : (int32_t)(-((( -scaled) + 50LL) / 100LL));
-        ampCompFrequencyArray[datasetIndex][pairIndex] = freq_fx;
+      int64_t scaled = (int64_t)freq_x100 * (1LL << FREQ_FRAC_BITS);
+      int32_t freq_fx = (scaled >= 0)
+                      ? (int32_t)((scaled + 50LL) / 100LL)
+                      : (int32_t)(-(((-scaled) + 50LL) / 100LL));
+      ampCompFrequencyArray[datasetIndex][pairIndex] = freq_fx;
 #endif
-        }
     }
+  }
 
+  // =========================================================================
+  // 2. AMP COMP TOP VALID PAIR INDICES (ampCompTopPair)
+  // =========================================================================
+  if (!LittleFS.exists("AmpCompTopPair")) {
+    fileAmpCompTopPairFS = LittleFS.open("AmpCompTopPair", "w+");
+    for (uint8_t i = 0; i < NUM_OSCILLATORS; ++i) {
+      AmpCompTopPairBankBuffer[i] = 18; // Default to pair 18
+    }
+    fileAmpCompTopPairFS.write(AmpCompTopPairBankBuffer, FSAmpCompTopPairBankSize);
+  } else {
+    fileAmpCompTopPairFS = LittleFS.open("AmpCompTopPair", "r");
+    fileAmpCompTopPairFS.read(AmpCompTopPairBankBuffer, FSAmpCompTopPairBankSize);
+  }
+  fileAmpCompTopPairFS.close();
 
-  uint8_t highestNoteFound = 255;
-  // for (int i = 0; i < NUM_OSCILLATORS; i++) {
-  //   highestOSCNote[i] =
-  //     if (highestOSCNote[i] < highestNoteFound) {
-  //     highestNoteFound = highestOSCNote[i];
-  //   }
-  // }
+  for (uint8_t i = 0; i < NUM_OSCILLATORS; ++i) {
+    ampCompTopPair[i] = AmpCompTopPairBankBuffer[i];
+    if (ampCompTopPair[i] < 4 || ampCompTopPair[i] >= (chanLevelVoiceDataSize / 2)) {
+      ampCompTopPair[i] = 18;
+    }
+  }
 
-  // PW CALIBRATION VALUES FROM FS (one slot per PW channel).
+  // =========================================================================
+  // 3. 3-POINT PULSE WIDTH CALIBRATION (PWCal3Pt - 18 Bytes / Channel)
+  // =========================================================================
 #if PROJECT_INSTRUMENT == 4
   ensure_pw_fs_banks();
 #endif
 
-  // PW_CENTER
-  if (!LittleFS.exists("PWCenter")) {
-    filePWCenterFS = LittleFS.open("PWCenter", "w+");
-    for (uint8_t v = 0; v < NUM_PW_CHANNELS; ++v) {
-      pack_pw_u16(PWCenterBankBuffer, v, kPwCenterDefault[v]);
+  if (!LittleFS.exists("PWCal3Pt")) {
+    filePWCalFS = LittleFS.open("PWCal3Pt", "w+");
+    for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+      uint16_t c = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW / 2) : 0;
+      PWCalLimits pDefault = { c, 0, (uint16_t)DIV_COUNTER_PW };
+      pack_pw_limits_point(PWCalBankBuffer, ch, 0, pDefault); // Low
+      pack_pw_limits_point(PWCalBankBuffer, ch, 1, pDefault); // Mid
+      pack_pw_limits_point(PWCalBankBuffer, ch, 2, pDefault); // High
     }
-    filePWCenterFS.write(PWCenterBankBuffer, FSPWBankSize);
+    filePWCalFS.write(PWCalBankBuffer, FSPWBankSize);
   } else {
-    filePWCenterFS = LittleFS.open("PWCenter", "r");
-    filePWCenterFS.read(PWCenterBankBuffer, FSPWBankSize);
+    filePWCalFS = LittleFS.open("PWCal3Pt", "r");
+    filePWCalFS.read(PWCalBankBuffer, FSPWBankSize);
   }
-  filePWCenterFS.close();
+  filePWCalFS.close();
 
-  // PW_HIGH_LIMIT
-  if (!LittleFS.exists("PWHighLimit")) {
-    filePWHighLimitFS = LittleFS.open("PWHighLimit", "w+");
-    for (uint8_t v = 0; v < NUM_PW_CHANNELS; ++v) {
-      pack_pw_u16(PWHighLimitBankBuffer, v, DIV_COUNTER_PW);
+  // Unpack into RAM
+  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    for (uint8_t pt = 0; pt < 3; ++pt) {
+      PW_CAL_LIMITS[ch][pt] = unpack_pw_limits_point(PWCalBankBuffer, ch, pt);
     }
-    filePWHighLimitFS.write(PWHighLimitBankBuffer, FSPWBankSize);
-  } else {
-    filePWHighLimitFS = LittleFS.open("PWHighLimit", "r");
-    filePWHighLimitFS.read(PWHighLimitBankBuffer, FSPWBankSize);
+    // Set legacy 440 Hz anchor shortcuts from Point 1
+    PW_CENTER[ch]     = PW_CAL_LIMITS[ch][1].center;
+    PW_LOW_LIMIT[ch]  = PW_CAL_LIMITS[ch][1].lowLimit;
+    PW_HIGH_LIMIT[ch] = PW_CAL_LIMITS[ch][1].highLimit;
   }
-  filePWHighLimitFS.close();
 
-  // PW_LOW_LIMIT
-  if (!LittleFS.exists("PWLowLimit")) {
-    filePWLowLimitFS = LittleFS.open("PWLowLimit", "w+");
-    for (uint8_t v = 0; v < NUM_PW_CHANNELS; ++v) {
-      pack_pw_u16(PWLowLimitBankBuffer, v, 0);
-    }
-    filePWLowLimitFS.write(PWLowLimitBankBuffer, FSPWBankSize);
-  } else {
-    filePWLowLimitFS = LittleFS.open("PWLowLimit", "r");
-    filePWLowLimitFS.read(PWLowLimitBankBuffer, FSPWBankSize);
-  }
-  filePWLowLimitFS.close();
-  // Manual calibration offsets (one signed byte per oscillator).
+  // =========================================================================
+  // 4. MANUAL OFFSETS & 440 ANCHORS
+  // =========================================================================
   if (!LittleFS.exists("ManualOffset")) {
     fileManualOffsetFS = LittleFS.open("ManualOffset", "w+");
-    // Initialise FS with zeros so future reads are defined.
-    for (int i = 0; i < FSManualOffsetBankSize; ++i) {
-      ManualOffsetBankBuffer[i] = 0;
-    }
+    for (int i = 0; i < FSManualOffsetBankSize; ++i) ManualOffsetBankBuffer[i] = 0;
     fileManualOffsetFS.write(ManualOffsetBankBuffer, FSManualOffsetBankSize);
   } else {
     fileManualOffsetFS = LittleFS.open("ManualOffset", "r");
@@ -140,18 +239,13 @@ void init_FS() {
   }
   fileManualOffsetFS.close();
 
-  // Copy stored offsets into the runtime array.
   for (int osc = 0; osc < NUM_OSCILLATORS; ++osc) {
     manualCalibrationOffset[osc] = (int8_t)ManualOffsetBankBuffer[osc];
   }
 
-  // 440 Hz manual anchor values (one uint16 per oscillator, little-endian).
   if (!LittleFS.exists("AmpComp440")) {
     fileAmpComp440FS = LittleFS.open("AmpComp440", "w+");
-    // Initialise FS with zeros (0 = never set) so future reads are defined.
-    for (int i = 0; i < FSAmpComp440BankSize; ++i) {
-      AmpComp440BankBuffer[i] = 0;
-    }
+    for (int i = 0; i < FSAmpComp440BankSize; ++i) AmpComp440BankBuffer[i] = 0;
     fileAmpComp440FS.write(AmpComp440BankBuffer, FSAmpComp440BankSize);
   } else {
     fileAmpComp440FS = LittleFS.open("AmpComp440", "r");
@@ -166,12 +260,9 @@ void init_FS() {
     ampComp440[osc] = v;
   }
 
-  // Duty target trims (one int16 per oscillator, little-endian; 0 = none).
   if (!LittleFS.exists("AmpCompDutyOffset")) {
     fileAmpCompDutyOffsetFS = LittleFS.open("AmpCompDutyOffset", "w+");
-    for (int i = 0; i < FSAmpCompDutyOffsetBankSize; ++i) {
-      AmpCompDutyOffsetBankBuffer[i] = 0;
-    }
+    for (int i = 0; i < FSAmpCompDutyOffsetBankSize; ++i) AmpCompDutyOffsetBankBuffer[i] = 0;
     fileAmpCompDutyOffsetFS.write(AmpCompDutyOffsetBankBuffer, FSAmpCompDutyOffsetBankSize);
   } else {
     fileAmpCompDutyOffsetFS = LittleFS.open("AmpCompDutyOffset", "r");
@@ -187,19 +278,16 @@ void init_FS() {
   }
 
 #endif
-
-  //singleFileDrive.begin("voiceTables", "voicetables.txt");
 }
 
-// Persist one oscillator's calibrationData slice into voiceTables. Called from DCO_calibration().
+// =============================================================================
+// Update Functions (Writing Calibration Data to LittleFS)
+// =============================================================================
+
 void update_FS_voice(byte voiceN) {
   byte calibrationDataBytes[FSVoiceDataSize];
 
-  // Serialize calibrationData (uint32_t pairs: [freq_x100, pwm]) for this voice
-  // into a contiguous byte buffer. Each entry is written little-endian.
-
   for (int i = 0; i < chanLevelVoiceDataSize; i++) {
-    // freq_to_amp_comp_array[i + (voiceN * chanLevelVoiceDataSize)] = calibrationData[i]; // can be used for in-RAM updates if desired
     byte *b = (byte *)&calibrationData[i];
     for (int j = 0; j < 4; j++) {
       calibrationDataBytes[i * 4 + j] = b[j];
@@ -213,63 +301,61 @@ void update_FS_voice(byte voiceN) {
   fileVoiceTablesFS.close();
 }
 
+// Persist complete 3-Point calibration for one PW channel (18 Bytes)
+void update_FS_PW_Channel(byte ch) {
+  if (ch >= NUM_PW_CHANNELS) return;
 
-// Persist PW center for one PW channel. Called from find_PW_center().
+  for (uint8_t pt = 0; pt < 3; ++pt) {
+    pack_pw_limits_point(PWCalBankBuffer, ch, pt, PW_CAL_LIMITS[ch][pt]);
+  }
+
+  PW_CENTER[ch]     = PW_CAL_LIMITS[ch][1].center;
+  PW_LOW_LIMIT[ch]  = PW_CAL_LIMITS[ch][1].lowLimit;
+  PW_HIGH_LIMIT[ch] = PW_CAL_LIMITS[ch][1].highLimit;
+
+  uint16_t startByteN = ch * FSPWDataSize;
+
+  filePWCalFS = LittleFS.open("PWCal3Pt", "r+");
+  filePWCalFS.seek(startByteN);
+  filePWCalFS.write(&PWCalBankBuffer[startByteN], FSPWDataSize);
+  filePWCalFS.close();
+}
+
+// Persist top valid pair index from Amp Comp
+void update_FS_AmpCompTopPair(byte oscIndex, uint8_t value) {
+  if (oscIndex >= NUM_OSCILLATORS) return;
+  ampCompTopPair[oscIndex] = value;
+  AmpCompTopPairBankBuffer[oscIndex] = value;
+
+  fileAmpCompTopPairFS = LittleFS.open("AmpCompTopPair", "r+");
+  fileAmpCompTopPairFS.seek(oscIndex * FSAmpCompTopPairDataSize);
+  fileAmpCompTopPairFS.write(&value, FSAmpCompTopPairDataSize);
+  fileAmpCompTopPairFS.close();
+}
+
 void update_FS_PWCenter(byte voiceN, uint16_t value) {
-  if (voiceN >= NUM_PW_CHANNELS) {
-    return;
-  }
-  byte calibrationDataBytes[FSPWDataSize];
-  byte *b = (byte *)&value;
-
-  uint16_t startByteN = voiceN * FSPWDataSize;
-
-  filePWCenterFS = LittleFS.open("PWCenter", "r+");
-  filePWCenterFS.seek(startByteN);
-  filePWCenterFS.write(b, FSPWDataSize);
-  filePWCenterFS.close();
+  if (voiceN >= NUM_PW_CHANNELS) return;
+  PW_CAL_LIMITS[voiceN][1].center = value;
+  update_FS_PW_Channel(voiceN);
 }
 
-// Persist PW high limit for one PW channel. Called from find_PW_limit_v2().
 void update_FS_PW_High_Limit(byte voiceN, uint16_t value) {
-  if (voiceN >= NUM_PW_CHANNELS) {
-    return;
-  }
-  byte calibrationDataBytes[FSPWDataSize];
-  byte *b = (byte *)&value;
-
-  uint16_t startByteN = voiceN * FSPWDataSize;
-
-  filePWHighLimitFS = LittleFS.open("PWHighLimit", "r+");
-  filePWHighLimitFS.seek(startByteN);
-  filePWHighLimitFS.write(b, FSPWDataSize);
-  filePWHighLimitFS.close();
+  if (voiceN >= NUM_PW_CHANNELS) return;
+  PW_CAL_LIMITS[voiceN][1].highLimit = value;
+  update_FS_PW_Channel(voiceN);
 }
 
-// Persist PW low limit for one PW channel. Called from find_PW_limit_v2().
 void update_FS_PW_Low_Limit(byte voiceN, uint16_t value) {
-  if (voiceN >= NUM_PW_CHANNELS) {
-    return;
-  }
-  byte calibrationDataBytes[FSPWDataSize];
-  byte *b = (byte *)&value;
-
-  uint16_t startByteN = voiceN * FSPWDataSize;
-
-  filePWLowLimitFS = LittleFS.open("PWLowLimit", "r+");
-  filePWLowLimitFS.seek(startByteN);
-  filePWLowLimitFS.write(b, FSPWDataSize);
-  filePWLowLimitFS.close();
+  if (voiceN >= NUM_PW_CHANNELS) return;
+  PW_CAL_LIMITS[voiceN][1].lowLimit = value;
+  update_FS_PW_Channel(voiceN);
 }
 
-// Persist a single manualCalibrationOffset entry for the given oscillator index.
-// Persist one oscillator's manual calibration offset. Called from apply_param_manual_calibration_store().
 void update_FS_ManualCalibrationOffset(byte oscIndex, int8_t value) {
-  if (oscIndex >= NUM_OSCILLATORS) {
-    return;
-  }
+  if (oscIndex >= NUM_OSCILLATORS) return;
+  manualCalibrationOffset[oscIndex] = value;
 
-  uint8_t b = (uint8_t)value;  // store raw signed byte
+  uint8_t b = (uint8_t)value;
   uint16_t startByteN = oscIndex * FSManualOffsetDataSize;
 
   fileManualOffsetFS = LittleFS.open("ManualOffset", "r+");
@@ -278,12 +364,9 @@ void update_FS_ManualCalibrationOffset(byte oscIndex, int8_t value) {
   fileManualOffsetFS.close();
 }
 
-// Persist one oscillator's 440 Hz manual anchor value (ampComp440[]).
-// Called from apply_param_manual_calibration_store().
 void update_FS_AmpComp440(byte oscIndex, uint16_t value) {
-  if (oscIndex >= NUM_OSCILLATORS) {
-    return;
-  }
+  if (oscIndex >= NUM_OSCILLATORS) return;
+  ampComp440[oscIndex] = value;
 
   byte *b = (byte *)&value;
   uint16_t startByteN = oscIndex * FSAmpComp440DataSize;
@@ -294,12 +377,9 @@ void update_FS_AmpComp440(byte oscIndex, uint16_t value) {
   fileAmpComp440FS.close();
 }
 
-// Persist one oscillator's duty target trim (ampCompDutyOffset[]).
-// Called from apply_param_manual_calibration_store().
 void update_FS_AmpCompDutyOffset(byte oscIndex, int16_t value) {
-  if (oscIndex >= NUM_OSCILLATORS) {
-    return;
-  }
+  if (oscIndex >= NUM_OSCILLATORS) return;
+  ampCompDutyOffset[oscIndex] = value;
 
   byte *b = (byte *)&value;
   uint16_t startByteN = oscIndex * FSAmpCompDutyOffsetDataSize;
@@ -310,85 +390,73 @@ void update_FS_AmpCompDutyOffset(byte oscIndex, int16_t value) {
   fileAmpCompDutyOffsetFS.close();
 }
 
-// Archived amp-comp PWM curve (old wrap 10000), used as shape reference for fakes.
-// See _removed/amp_comp.h — excludes the leading (0,0) and trailing sentinel pair.
+// =============================================================================
+// Fake Table Seeding & Diagnostics
+// =============================================================================
+
 static const uint16_t kFakeAmpPwmRef[] = {
   40, 50, 62, 79, 101, 130, 170, 222, 292, 386,
   511, 675, 924, 1252, 1688, 2231, 3034, 4132, 5632, 7676, 10000
 };
-static constexpr int kFakeAmpPwmRefCount =
-  (int)(sizeof(kFakeAmpPwmRef) / sizeof(kFakeAmpPwmRef[0]));
+static constexpr int kFakeAmpPwmRefCount = (int)(sizeof(kFakeAmpPwmRef) / sizeof(kFakeAmpPwmRef[0]));
 static constexpr uint16_t kFakeAmpPwmRefWrap = 10000;
 static constexpr uint32_t kFakeUnreachableFreqX100 = 20000000u;
 
-// Truncate/create a LittleFS file and write a full bank in one shot.
-// Non-static: also used by the bulk-restore path in preset_store.ino.
 void write_fs_bank(const char* name, const uint8_t* data, size_t size) {
   File f = LittleFS.open(name, "w");
-  if (!f) {
-    return;
-  }
+  if (!f) return;
   f.write(data, size);
   f.close();
 }
+
 #if PROJECT_INSTRUMENT == 4
 static bool fs_file_size_ok(const char* name, size_t expected) {
   File f = LittleFS.open(name, "r");
-  if (!f) {
-    return false;
-  }
+  if (!f) return false;
   const size_t sz = f.size();
   f.close();
   return sz == expected;
 }
 
-// Rewrite 4-voice PW banks if missing or still the old 8-slot (16 B) size.
-// DCO4-only migration: must never run on DCO3, where it would overwrite a
-// measured PW center with defaults.
 static void ensure_pw_fs_banks() {
-  if (fs_file_size_ok("PWCenter", FSPWBankSize) &&
-      fs_file_size_ok("PWHighLimit", FSPWBankSize) &&
-      fs_file_size_ok("PWLowLimit", FSPWBankSize)) {
+  if (fs_file_size_ok("PWCal3Pt", FSPWBankSize) &&
+      fs_file_size_ok("AmpCompTopPair", FSAmpCompTopPairBankSize)) {
     return;
   }
-  for (uint8_t v = 0; v < NUM_PW_CHANNELS; ++v) {
-    pack_pw_u16(PWCenterBankBuffer, v, kPwCenterDefault[v]);
-    pack_pw_u16(PWLowLimitBankBuffer, v, 0);
-    pack_pw_u16(PWHighLimitBankBuffer, v, DIV_COUNTER_PW);
+
+  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    uint16_t c = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW / 2) : 0;
+    PWCalLimits pDefault = { c, 0, (uint16_t)DIV_COUNTER_PW };
+    pack_pw_limits_point(PWCalBankBuffer, ch, 0, pDefault);
+    pack_pw_limits_point(PWCalBankBuffer, ch, 1, pDefault);
+    pack_pw_limits_point(PWCalBankBuffer, ch, 2, pDefault);
   }
-  write_fs_bank("PWCenter", PWCenterBankBuffer, FSPWBankSize);
-  write_fs_bank("PWLowLimit", PWLowLimitBankBuffer, FSPWBankSize);
-  write_fs_bank("PWHighLimit", PWHighLimitBankBuffer, FSPWBankSize);
+
+  for (uint8_t osc = 0; osc < NUM_OSCILLATORS; ++osc) {
+    AmpCompTopPairBankBuffer[osc] = 18;
+  }
+
+  write_fs_bank("PWCal3Pt", PWCalBankBuffer, FSPWBankSize);
+  write_fs_bank("AmpCompTopPair", AmpCompTopPairBankBuffer, FSAmpCompTopPairBankSize);
 }
 #endif
 
-// Build one oscillator's 22 [freq_x100, RANGE PWM] pairs matching real cal layout.
 void generate_fake_calibration_data(uint8_t osc, uint32_t* out) {
-  if (out == nullptr) {
-    return;
-  }
-  if (osc >= NUM_OSCILLATORS) {
-    osc = NUM_OSCILLATORS - 1;
-  }
+  if (out == nullptr) return;
+  if (osc >= NUM_OSCILLATORS) osc = NUM_OSCILLATORS - 1;
 
-  // Small per-osc spread so tables are not identical. Sized for the largest
-  // board (8 oscillators); smaller boards index only the first entries.
   static const float kOscScale[8] = {
     1.00f, 1.02f, 0.98f, 1.01f, 0.99f, 1.03f, 0.97f, 1.00f
   };
   const float oscScale = kOscScale[osc];
   const uint32_t pwmSat = (uint32_t)(0.98f * (float)DIV_COUNTER);
 
-  // Pair 0: lowest-freq anchor (same header as restart_DCO_calibration).
   out[0] = 0;
   out[1] = (uint32_t)ampCompLowestFreqVal;
 
-  // Pair 1: note (start - interval) with manual seed PWM.
-  const uint8_t headerNote =
-    (uint8_t)(DCO_calibration_start_note - calibration_note_interval);
+  const uint8_t headerNote = (uint8_t)(DCO_calibration_start_note - calibration_note_interval);
   out[2] = (uint32_t)(sNotePitches[headerNote - 12] * 100.0f);
-  out[3] = (uint32_t)(initManualAmpCompCalibrationVal[osc] +
-                      manualCalibrationOffset[osc]);
+  out[3] = (uint32_t)(initManualAmpCompCalibrationVal[osc] + manualCalibrationOffset[osc]);
 
   bool plateau = false;
   for (int pair = 2; pair < ampCompTableSize; ++pair) {
@@ -400,35 +468,22 @@ void generate_fake_calibration_data(uint8_t osc, uint32_t* out) {
       continue;
     }
 
-    const uint8_t note =
-      (uint8_t)(DCO_calibration_start_note +
-                calibration_note_interval * (pair - 2));
+    const uint8_t note = (uint8_t)(DCO_calibration_start_note + calibration_note_interval * (pair - 2));
     const int pitchIdx = (int)note - 12;
-    if (pitchIdx < 0 ||
-        pitchIdx >= (int)(sizeof(sNotePitches) / sizeof(sNotePitches[0]))) {
+    if (pitchIdx < 0 || pitchIdx >= (int)(sizeof(sNotePitches) / sizeof(sNotePitches[0]))) {
       out[i]     = kFakeUnreachableFreqX100;
       out[i + 1] = DIV_COUNTER;
       plateau = true;
       continue;
     }
 
-    // Map archived curve onto calibrated slots (pair 2 → ref[1], …).
     int refIdx = pair - 1;
-    if (refIdx < 0) {
-      refIdx = 0;
-    }
-    if (refIdx >= kFakeAmpPwmRefCount) {
-      refIdx = kFakeAmpPwmRefCount - 1;
-    }
+    if (refIdx < 0) refIdx = 0;
+    if (refIdx >= kFakeAmpPwmRefCount) refIdx = kFakeAmpPwmRefCount - 1;
 
-    float pwmF = ((float)kFakeAmpPwmRef[refIdx] / (float)kFakeAmpPwmRefWrap) *
-                 (float)DIV_COUNTER * oscScale;
-    if (pwmF < 1.0f) {
-      pwmF = 1.0f;
-    }
-    if (pwmF > (float)DIV_COUNTER) {
-      pwmF = (float)DIV_COUNTER;
-    }
+    float pwmF = ((float)kFakeAmpPwmRef[refIdx] / (float)kFakeAmpPwmRefWrap) * (float)DIV_COUNTER * oscScale;
+    if (pwmF < 1.0f) pwmF = 1.0f;
+    if (pwmF > (float)DIV_COUNTER) pwmF = (float)DIV_COUNTER;
     uint32_t pwm = (uint32_t)(pwmF + 0.5f);
 
     if (pwm >= pwmSat) {
@@ -443,20 +498,13 @@ void generate_fake_calibration_data(uint8_t osc, uint32_t* out) {
   }
 }
 
-// Seed LittleFS with fake amp-comp tables + PW defaults + AmpComp440, then reload.
-// force=false: only if voiceTables is missing. force=true: overwrite + precompute (cmd 30).
-// Silent: no Serial (Core1 / TinyUSB race). Call before init_FS() at boot so stubs
-// do not mask a missing file.
 void seed_fake_calibration_tables(bool force) {
   LittleFS.begin();
-  if (!force && LittleFS.exists("voiceTables")) {
-    return;
-  }
+  if (!force && LittleFS.exists("voiceTables")) return;
 
   for (uint8_t osc = 0; osc < NUM_OSCILLATORS; ++osc) {
     generate_fake_calibration_data(osc, calibrationData);
 
-    // Pack LE uint32 pairs into the full voiceTables bank (same as update_FS_voice).
     const uint16_t startByteN = osc * FSVoiceDataSize;
     for (int i = 0; i < chanLevelVoiceDataSize; ++i) {
       const byte* b = (const byte*)&calibrationData[i];
@@ -464,28 +512,32 @@ void seed_fake_calibration_tables(bool force) {
         voiceTablesBankBuffer[startByteN + i * 4 + j] = b[j];
       }
     }
-
   }
 
-  // Sane PW defaults (empty FS would otherwise load zeros over RAM defaults).
-  for (uint8_t v = 0; v < NUM_PW_CHANNELS; ++v) {
-    pack_pw_u16(PWCenterBankBuffer, v, kPwCenterDefault[v]);
-    pack_pw_u16(PWLowLimitBankBuffer, v, 0);
-    pack_pw_u16(PWHighLimitBankBuffer, v, DIV_COUNTER_PW);
+  // Seed 3-Point PW default banks (18 Bytes / Channel)
+  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
+    uint16_t c = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW / 2) : 0;
+    PWCalLimits pDefault = { c, 0, (uint16_t)DIV_COUNTER_PW };
+
+    pack_pw_limits_point(PWCalBankBuffer, ch, 0, pDefault);
+    pack_pw_limits_point(PWCalBankBuffer, ch, 1, pDefault);
+    pack_pw_limits_point(PWCalBankBuffer, ch, 2, pDefault);
+  }
+
+  // Seed TopPair defaults
+  for (uint8_t osc = 0; osc < NUM_OSCILLATORS; ++osc) {
+    AmpCompTopPairBankBuffer[osc] = 18;
   }
 
   static constexpr uint16_t kFakeAmpComp440 = DIV_COUNTER / 10;
   for (uint8_t osc = 0; osc < NUM_OSCILLATORS; ++osc) {
-    AmpComp440BankBuffer[osc * FSAmpComp440DataSize + 0] =
-      (uint8_t)(kFakeAmpComp440 & 0xFF);
-    AmpComp440BankBuffer[osc * FSAmpComp440DataSize + 1] =
-      (uint8_t)((kFakeAmpComp440 >> 8) & 0xFF);
+    AmpComp440BankBuffer[osc * FSAmpComp440DataSize + 0] = (uint8_t)(kFakeAmpComp440 & 0xFF);
+    AmpComp440BankBuffer[osc * FSAmpComp440DataSize + 1] = (uint8_t)((kFakeAmpComp440 >> 8) & 0xFF);
   }
 
   write_fs_bank("voiceTables", voiceTablesBankBuffer, FSBankSize);
-  write_fs_bank("PWCenter", PWCenterBankBuffer, FSPWBankSize);
-  write_fs_bank("PWLowLimit", PWLowLimitBankBuffer, FSPWBankSize);
-  write_fs_bank("PWHighLimit", PWHighLimitBankBuffer, FSPWBankSize);
+  write_fs_bank("PWCal3Pt", PWCalBankBuffer, FSPWBankSize);
+  write_fs_bank("AmpCompTopPair", AmpCompTopPairBankBuffer, FSAmpCompTopPairBankSize);
   write_fs_bank("AmpComp440", AmpComp440BankBuffer, FSAmpComp440BankSize);
 
   init_FS();
