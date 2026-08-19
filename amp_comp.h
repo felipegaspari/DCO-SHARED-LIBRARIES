@@ -12,10 +12,11 @@ static constexpr int32_t AMP_COMP_MAX_HZ  = 7000;
 
 int32_t freq_to_amp_comp_array[chanLevelVoiceDataSize * NUM_OSCILLATORS];
 
-// Per-oscillator plateau metadata:
-int16_t plateauStartIndex[NUM_OSCILLATORS];
-int32_t plateauStartFreqQ[NUM_OSCILLATORS];
-float   plateauStartFreqHz[NUM_OSCILLATORS];
+// Explicit Max Frequencies loaded from flash (User must populate highestFreqFoundHz before precompute)
+float highestFreqFoundHz[NUM_OSCILLATORS];
+
+// Derived high-speed clamp ceilings
+int32_t ampCompMaxFreqQ[NUM_OSCILLATORS];
 
 // Calibration levels (PWM counts)
 int32_t ampCompArray[NUM_OSCILLATORS][ampCompTableSize + 1];
@@ -28,7 +29,7 @@ static constexpr int32_t AMP_COMP_MAX_HZ_Q = (int32_t)(AMP_COMP_MAX_HZ << FREQ_F
 int32_t ampCompFrequencyArray[NUM_OSCILLATORS][ampCompTableSize + 1]; // Q8 Hz
 static constexpr int T_FRAC = 12;
 
-// REFACTORED: Grouped fixed-point window data for better cache locality (AoS)
+// Grouped fixed-point window data for better cache locality (AoS)
 struct FixedQuadWindow {
     int32_t  xBase;
     int32_t  dx;
@@ -46,7 +47,7 @@ bool amp_quad_muls_i32 = false;
 // Last quadratic window per osc for FIXED / FLOAT_QUAD find (-1 = cold).
 int16_t ampWinCache[NUM_OSCILLATORS];
 
-// REFACTORED: Grouped high-precision float coefficients for better cache locality
+// Grouped high-precision float coefficients for better cache locality
 struct FloatQuadCoeffs {
     float a;
     float b;
@@ -56,6 +57,7 @@ FloatQuadCoeffs floatCoeffs[NUM_OSCILLATORS][ampCompTableSize - 1];
 
 // Float-domain frequency breakpoints (Hz) used by the float amp-comp path.
 #ifdef USE_FLOAT_AMP_COMP
+float ampCompMaxFreqHz[NUM_OSCILLATORS];
 float ampCompFrequencyHz[NUM_OSCILLATORS][ampCompTableSize + 1];
 // Dense LUT: index = integer Hz, value = RANGE PWM. Filled from float quadratic.
 uint16_t ampCompLut[NUM_OSCILLATORS][AMP_COMP_MAX_HZ + 1];
@@ -100,10 +102,17 @@ static inline void amp_comp_set_method(uint8_t m) {
 // Precompute Functions
 // ---------------------------------------------------------------------------
 
-static void precomputeCoefficients(bool rewritePlateaus = true) {
+static void precomputeCoefficients() {
   static_assert(T_FRAC > 0 && T_FRAC < 28, "T_FRAC must be in a valid range.");
 
   for (int j = 0; j < NUM_OSCILLATORS; ++j) {
+      float maxHz = highestFreqFoundHz[j];
+      // Safeguard: fallback to stock ceiling if uncalibrated or invalid
+      if (maxHz <= 0.0f || maxHz > (float)AMP_COMP_MAX_HZ) {
+          maxHz = (float)AMP_COMP_MAX_HZ;
+      }
+      ampCompMaxFreqQ[j] = (int32_t)lrintf(maxHz * (float)(1 << FREQ_FRAC_BITS));
+      
       ampCompFrequencyArray[j][ampCompTableSize] = AMP_COMP_MAX_HZ_Q;
       ampCompArray[j][ampCompTableSize] = DIV_COUNTER;
   }
@@ -113,11 +122,6 @@ static void precomputeCoefficients(bool rewritePlateaus = true) {
   const double maxFreqHz    = (double)AMP_COMP_MAX_HZ;
 
   for (int j = 0; j < NUM_OSCILLATORS; j++) {
-    bool plateauSeen = false;  
-
-    plateauStartIndex[j] = -1;
-    plateauStartFreqQ[j] = AMP_COMP_MAX_HZ_Q;
-
     for (int i = 0; i < ampCompTableSize - 1; ++i) {
       double x0_f = (double)ampCompFrequencyArray[j][i]     * invFreqScale;
       double x1_f = (double)ampCompFrequencyArray[j][i + 1] * invFreqScale;
@@ -128,26 +132,6 @@ static void precomputeCoefficients(bool rewritePlateaus = true) {
 
       if (ampCompFrequencyArray[j][i + 1] >= AMP_COMP_MAX_HZ_Q) x1_f = maxFreqHz;
       if (ampCompFrequencyArray[j][i + 2] >= AMP_COMP_MAX_HZ_Q) x2_f = maxFreqHz;
-
-      if (y1_f >= DIV_COUNTER && y2_f >= DIV_COUNTER) {
-        if (!plateauSeen && plateauStartIndex[j] < 0 && ampCompFrequencyArray[j][i + 1] < AMP_COMP_MAX_HZ_Q) {
-          plateauStartIndex[j] = i + 1;
-          plateauStartFreqQ[j] = ampCompFrequencyArray[j][i + 1];
-          plateauSeen = true;
-        }
-        if (rewritePlateaus) {
-          double plateau_end_y = (double)DIV_COUNTER;
-          x1_f = (x0_f + maxFreqHz) * 0.5;
-          y1_f = (y0_f + plateau_end_y) * 0.5;
-          x2_f = maxFreqHz;
-          y2_f = plateau_end_y;
-
-          ampCompFrequencyArray[j][i + 1] = (int32_t)llround(x1_f * freqScale);
-          ampCompArray[j][i + 1] = (int32_t)llround(y1_f);
-          ampCompFrequencyArray[j][i + 2] = AMP_COMP_MAX_HZ_Q;
-          ampCompArray[j][i + 2] = (int32_t)DIV_COUNTER;
-        }
-      }
 
       long double denom_ld = (long double)(x0_f - x1_f) * (long double)(x0_f - x2_f) * (long double)(x1_f - x2_f);
       if (denom_ld == 0.0L) denom_ld = 1.0L;
@@ -230,19 +214,20 @@ static void precomputeCoefficients(bool rewritePlateaus = true) {
 
 #ifdef USE_FLOAT_AMP_COMP
 static void precomputeCoefficients_float() {
+  const double maxFreqHz = (double)AMP_COMP_MAX_HZ;
+
   for (int j = 0; j < NUM_OSCILLATORS; ++j) {
+    float maxHz = highestFreqFoundHz[j];
+    if (maxHz <= 0.0f || maxHz > (float)AMP_COMP_MAX_HZ) {
+        maxHz = (float)AMP_COMP_MAX_HZ;
+    }
+    ampCompMaxFreqHz[j] = maxHz;
+      
     ampCompFrequencyHz[j][ampCompTableSize] = (float)AMP_COMP_MAX_HZ;
     ampCompArray[j][ampCompTableSize]       = DIV_COUNTER;
   }
 
-  const double maxFreqHz = (double)AMP_COMP_MAX_HZ;
-
   for (int j = 0; j < NUM_OSCILLATORS; ++j) {
-    bool plateauSeen = false; 
-
-    plateauStartIndex[j]  = -1;
-    plateauStartFreqHz[j] = (float)AMP_COMP_MAX_HZ;
-
     for (int i = 0; i < ampCompTableSize - 1; ++i) {
       double x0_f = (double)ampCompFrequencyHz[j][i];
       double x1_f = (double)ampCompFrequencyHz[j][i + 1];
@@ -253,25 +238,6 @@ static void precomputeCoefficients_float() {
 
       if (x1_f >= maxFreqHz) x1_f = maxFreqHz;
       if (x2_f >= maxFreqHz) x2_f = maxFreqHz;
-
-      if (y1_f >= DIV_COUNTER && y2_f >= DIV_COUNTER) {
-        if (!plateauSeen && plateauStartIndex[j] < 0 && ampCompFrequencyHz[j][i + 1] < (float)maxFreqHz) {
-          plateauStartIndex[j]  = i + 1;
-          plateauStartFreqHz[j] = ampCompFrequencyHz[j][i + 1];
-          plateauSeen = true;
-        }
-
-        double plateau_end_y = (double)DIV_COUNTER;
-        x1_f = (x0_f + maxFreqHz) * 0.5;
-        y1_f = (y0_f + plateau_end_y) * 0.5;
-        x2_f = maxFreqHz;
-        y2_f = plateau_end_y;
-
-        ampCompFrequencyHz[j][i + 1] = (float)x1_f;
-        ampCompArray[j][i + 1]       = (int32_t)llround(y1_f);
-        ampCompFrequencyHz[j][i + 2] = (float)maxFreqHz;
-        ampCompArray[j][i + 2]       = (int32_t)DIV_COUNTER;
-      }
 
       long double denom_ld = (long double)(x0_f - x1_f) * (long double)(x0_f - x2_f) * (long double)(x1_f - x2_f);
       if (denom_ld == 0.0L) denom_ld = 1.0L;
@@ -291,8 +257,6 @@ static void precomputeCoefficients_float() {
       floatCoeffs[j][i].a = (float)aVal_ld;
       floatCoeffs[j][i].b = (float)bVal_ld;
       floatCoeffs[j][i].c = (float)cVal_ld;
-
-      ampCompFrequencyHz[j][i] = (float)x0_f;
     }
   }
 }
@@ -301,8 +265,16 @@ uint16_t get_chan_level_float_quad(float freqHz, uint8_t voiceN);
 
 static inline void fill_amp_comp_lut_from_quad() {
   for (uint8_t o = 0; o < NUM_OSCILLATORS; ++o) {
-    for (int32_t hz = 0; hz <= AMP_COMP_MAX_HZ; ++hz) {
+    int32_t maxHz = (int32_t)ampCompMaxFreqHz[o];
+    if (maxHz > AMP_COMP_MAX_HZ) maxHz = AMP_COMP_MAX_HZ;
+
+    // Evaluate curve up to the true maximum
+    for (int32_t hz = 0; hz < maxHz; ++hz) {
       ampCompLut[o][hz] = get_chan_level_float_quad((float)hz, o);
+    }
+    // Block-fill saturated plateau instantly
+    for (int32_t hz = maxHz; hz <= AMP_COMP_MAX_HZ; ++hz) {
+      ampCompLut[o][hz] = (uint16_t)DIV_COUNTER;
     }
   }
 }
@@ -322,33 +294,11 @@ static inline void amp_comp_seed_fixed_from_float_tables() {
 static inline void precompute_amp_comp_for_engine() {
 #ifdef USE_FLOAT_AMP_COMP
   precomputeCoefficients_float();
-
-  // Save the refactored structs
-  FloatQuadCoeffs floatCoeffsSave[NUM_OSCILLATORS][ampCompTableSize - 1];
-  int16_t plateauIdxSave[NUM_OSCILLATORS];
-  float plateauHzSave[NUM_OSCILLATORS];
-  int32_t ampSave[NUM_OSCILLATORS][ampCompTableSize + 1];
-  int32_t plateauQSave[NUM_OSCILLATORS];
-
-  memcpy(floatCoeffsSave, floatCoeffs, sizeof(floatCoeffsSave));
-  memcpy(plateauIdxSave, plateauStartIndex, sizeof(plateauIdxSave));
-  memcpy(plateauHzSave, plateauStartFreqHz, sizeof(plateauHzSave));
-  memcpy(ampSave, ampCompArray, sizeof(ampSave));
-
   amp_comp_seed_fixed_from_float_tables();
-  precomputeCoefficients(false);
-  memcpy(plateauQSave, plateauStartFreqQ, sizeof(plateauQSave));
-
-  // Restore the refactored structs
-  memcpy(floatCoeffs, floatCoeffsSave, sizeof(floatCoeffsSave));
-  memcpy(plateauStartIndex, plateauIdxSave, sizeof(plateauIdxSave));
-  memcpy(plateauStartFreqHz, plateauHzSave, sizeof(plateauHzSave));
-  memcpy(ampCompArray, ampSave, sizeof(ampSave));
-  memcpy(plateauStartFreqQ, plateauQSave, sizeof(plateauQSave));
-
+  precomputeCoefficients();
   fill_amp_comp_lut_from_quad();
 #else
-  precomputeCoefficients(true);
+  precomputeCoefficients();
 #endif
   for (int o = 0; o < NUM_OSCILLATORS; ++o) ampWinCache[o] = -1;
 
