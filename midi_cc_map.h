@@ -21,7 +21,7 @@ static const MidiCcEntry midiCcMap[] = {
   {  20, PARAM_SYNC_MODE,                   0,   127, MIDI_CC_LINEAR },
   {  21, PARAM_SOFT_SYNC,                   0,   127, MIDI_CC_LINEAR },
   {  22, PARAM_SUBOSC_DIVIDE,               0,   127, MIDI_CC_LINEAR },
-  {  23, PARAM_OSC_SYNC_MODE,               0,   127, MIDI_CC_LINEAR },
+  {  23, PARAM_OSC_PHASE_SYNC,               0,   127, MIDI_CC_LINEAR },
   {  69, PARAM_VOICE_MODE,                  0,   127, MIDI_CC_LINEAR },
   {  78, PARAM_VOICE_ALLOC_MODE,            0,   127, MIDI_CC_LINEAR },
   {  70, PARAM_UNISON_DETUNE,               0,   127, MIDI_CC_LINEAR },
