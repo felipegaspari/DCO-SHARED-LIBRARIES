@@ -32,7 +32,7 @@
    PORTA_MODE_TIME = 0, ///< Fixed duration for any interval.
    PORTA_MODE_SLEW = 1  ///< Constant slew rate (duration scales with interval).
  };
- uint8_t portamento_mode = PORTA_MODE_SLEW;
+ uint8_t portamento_mode = PORTA_MODE_TIME;
  
  // Portamento state in Q24 (Hz * 2^24) — one slot per oscillator
  int64_t portamento_start_q24[NUM_OSCILLATORS];
@@ -46,7 +46,7 @@
  int32_t porta_note_cur_q16[NUM_OSCILLATORS];
  int32_t porta_note_step_q16[NUM_OSCILLATORS];  ///< Q16 semitones per µs.
  bool porta_note_valid[NUM_OSCILLATORS];
- 
+
  #ifdef USE_FLOAT_VOICE_TASK
  float porta_freq_start_f[NUM_OSCILLATORS];
  float porta_freq_stop_f [NUM_OSCILLATORS];
@@ -89,4 +89,11 @@
  static constexpr int32_t Q24_EPS_DELTA_1P00001 = 168; // round(0.00001 * 2^24)
  static constexpr int32_t Q24_ONE_EPS = Q24_ONE + Q24_EPS_DELTA_1P00001;
  
+void voice_task_fixed_point();
+void voice_task_float();
+void voice_task_main();
+void voice_mark_on(uint8_t voice, uint8_t note, uint8_t velocity);
+void voice_mark_off(uint8_t voice);
+void voice_mark_regate(uint8_t voice, uint8_t note);
+
  #endif // DCO_VOICES_H

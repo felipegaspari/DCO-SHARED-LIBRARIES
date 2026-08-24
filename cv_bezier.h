@@ -48,12 +48,13 @@
    return resultPoint.y;
  }
  
- inline void generateBezierArray(Point A, Point B, Point P1, Point P2, uint16_t arraySize,
-                                 uint16_t (&array)[4096]) {
-   for (int x = 0; x < arraySize; ++x) {
-     float yResult = findYForX(A, P1, P2, B, static_cast<float>(x));
-     array[x] = (uint16_t)yResult;
-   }
+ __attribute__((noinline))
+ void generateBezierArray(Point A, Point B, Point P1, Point P2, uint16_t arraySize,
+                          uint16_t (&array)[4096]) {
+     for (int x = 0; x < arraySize; ++x) {
+         float yResult = adsrBezierFindYForX(A, P1, P2, B, static_cast<float>(x));
+         array[x] = (uint16_t)yResult;
+     }
  }
  
  #endif // DCO_CV_BEZIER_H

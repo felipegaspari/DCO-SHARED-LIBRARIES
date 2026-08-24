@@ -1,6 +1,11 @@
 #ifndef __BENCH_H__
 #define __BENCH_H__
 
+#pragma GCC optimize ("Os")
+
+
+#ifdef BENCHMARKING_ENABLED
+
 // Realtime profiler for the DCO hot path.
 //
 // Enabled by RUNNING_AVERAGE in DCO.ino; every macro below compiles to nothing when it is
@@ -27,11 +32,11 @@
 // longer than BENCH_PERIOD_MAX_US are discarded. The 1 us timer remains for the dump
 // window gate only. The report flags any probe whose max lands near the wrap.
 
-#include <stdint.h>
-#include <stdio.h>
-#include <stdarg.h>
-#include <string.h>
-#include "pico/platform.h"
+// #include <stdint.h>
+// #include <stdio.h>
+// #include <stdarg.h>
+// #include <string.h>
+// #include "pico/platform.h"
 #include "hardware/clocks.h"
 #include "hardware/structs/systick.h"
 #include "hardware/structs/timer.h"
@@ -320,7 +325,7 @@ inline bool bench_out_drain_chunk() {
   return true;
 }
 
-#ifdef RUNNING_AVERAGE
+#if defined(RUNNING_AVERAGE)
 
 struct BenchDesc {
   uint8_t core;
@@ -1075,5 +1080,21 @@ inline void bench_poll_core0() {
 }
 
 #endif  // RUNNING_AVERAGE
+
+#else  // !BENCH_ENABLED
+
+// Compiles away to nothing — every call site still compiles, costs zero bytes
+#define BENCH_BEGIN(x)          do {} while (0)
+#define BENCH_END(x)            do {} while (0)
+#define BENCH_PERIOD(x)         do {} while (0)
+#define BENCH_SAMPLE_TICK()     do {} while (0)
+
+// Referenced as plain identifiers/functions elsewhere — stub them too
+static const bool bench_out_active = false;
+static inline void bench_request_dump() {}
+static inline void bench_reset_all() {}
+static inline void bench_toggle_periodic() {}
+
+#endif // BENCHMARKING_ENABLED
 
 #endif  // __BENCH_H__

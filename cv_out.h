@@ -16,9 +16,10 @@
  void update_CV_outs();
  void update_CV_outs_manual_calibration();
  
- void __not_in_flash_func(cv_bake_adsr2_to_vcf_scale)();
- void __not_in_flash_func(cv_bake_lfo2_to_vcf_scale)();
- void __not_in_flash_func(cv_bake_lfo1_to_vca_scale)();
- void cv_update_mod_scales();
+
+ void SRAM_HOT(cv_bake_adsr2_to_vcf_scale)();
+ void SRAM_HOT(cv_bake_lfo2_to_vcf_scale)();
+ void SRAM_HOT(cv_bake_lfo1_to_vca_scale)();
+ void SRAM_HOT(cv_update_mod_scales)();
  
  #endif // DCO_CV_OUT_H

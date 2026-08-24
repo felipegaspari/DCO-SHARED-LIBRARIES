@@ -23,18 +23,18 @@
  void init_pwm();
  
  #ifdef RANGE0_PIO_DITHER_TEST
- void init_range_pio_dither();
- void range_pio_set_level(uint8_t osc, uint16_t level);
+ void SRAM_HOT(init_range_pio_dither)();
+ void SRAM_HOT(range_pio_set_level)(uint8_t osc, uint16_t level);
  #endif
  
  #ifdef ENABLE_CV_OUTS
  void init_cv_pwm();
- void write_cv_pwm();
- void write_cv_pwm_raw(uint16_t cutoff, const uint16_t resonance[NUM_FILTERS], uint16_t vca,
+ void SRAM_HOT(write_cv_pwm)();
+ void SRAM_HOT(write_cv_pwm_raw)(uint16_t cutoff, const uint16_t resonance[NUM_FILTERS], uint16_t vca,
                        uint16_t dist_drive, uint16_t dist_mix);
  void init_level_pwm();
- void write_level_pwm();
- void write_level_pwm_raw(uint16_t osc1, uint16_t osc2, uint16_t osc3, uint16_t sub);
+ void SRAM_HOT(write_level_pwm)();
+ void SRAM_HOT(write_level_pwm_raw)(uint16_t osc1, uint16_t osc2, uint16_t osc3, uint16_t sub);
  #endif
  
  /**
@@ -42,7 +42,7 @@
   * @param osc Oscillator index (0..NUM_OSCILLATORS-1).
   * @param level Counter compare level.
   */
- static inline void write_range_pwm(uint8_t osc, uint16_t level) {
+ static inline void SRAM_HOT(write_range_pwm)(uint8_t osc, uint16_t level) {
  #ifdef RANGE0_PIO_DITHER_TEST
    range_pio_set_level(osc, level);
    return;

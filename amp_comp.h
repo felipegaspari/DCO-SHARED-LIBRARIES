@@ -10,7 +10,7 @@
 static constexpr int     ampCompTableSize = 22;
 static constexpr int32_t AMP_COMP_MAX_HZ  = 7000;
 
-int32_t freq_to_amp_comp_array[chanLevelVoiceDataSize * NUM_OSCILLATORS];
+SRAM_DATA int32_t freq_to_amp_comp_array[chanLevelVoiceDataSize * NUM_OSCILLATORS];
 
 // Explicit Max Frequencies loaded from flash (User must populate highestFreqFoundHz before precompute)
 float highestFreqFoundHz[NUM_OSCILLATORS];
@@ -26,7 +26,7 @@ static constexpr int     FREQ_FRAC_BITS    = 8;
 static constexpr int32_t AMP_COMP_SENTINEL_FREQ_Q = 50000000;
 static constexpr int32_t AMP_COMP_MAX_HZ_Q = (int32_t)(AMP_COMP_MAX_HZ << FREQ_FRAC_BITS);
 
-int32_t ampCompFrequencyArray[NUM_OSCILLATORS][ampCompTableSize + 1]; // Q8 Hz
+SRAM_DATA int32_t ampCompFrequencyArray[NUM_OSCILLATORS][ampCompTableSize + 1]; // Q8 Hz
 static constexpr int T_FRAC = 12;
 
 // Grouped fixed-point window data for better cache locality (AoS)
@@ -40,12 +40,12 @@ struct FixedQuadWindow {
     int32_t  aQ_fast;
     int32_t  bQ_fast;
 };
-FixedQuadWindow fixedWin[NUM_OSCILLATORS][ampCompTableSize - 1];
+SRAM_DATA FixedQuadWindow fixedWin[NUM_OSCILLATORS][ampCompTableSize - 1];
 
 bool amp_quad_muls_i32 = false;
 
 // Last quadratic window per osc for FIXED / FLOAT_QUAD find (-1 = cold).
-int16_t ampWinCache[NUM_OSCILLATORS];
+SRAM_DATA int16_t ampWinCache[NUM_OSCILLATORS];
 
 // Grouped high-precision float coefficients for better cache locality
 struct FloatQuadCoeffs {
@@ -53,14 +53,14 @@ struct FloatQuadCoeffs {
     float b;
     float c;
 };
-FloatQuadCoeffs floatCoeffs[NUM_OSCILLATORS][ampCompTableSize - 1];
+SRAM_DATA FloatQuadCoeffs floatCoeffs[NUM_OSCILLATORS][ampCompTableSize - 1];
 
 // Float-domain frequency breakpoints (Hz) used by the float amp-comp path.
 #ifdef USE_FLOAT_AMP_COMP
-float ampCompMaxFreqHz[NUM_OSCILLATORS];
-float ampCompFrequencyHz[NUM_OSCILLATORS][ampCompTableSize + 1];
+SRAM_DATA float ampCompMaxFreqHz[NUM_OSCILLATORS];
+SRAM_DATA float ampCompFrequencyHz[NUM_OSCILLATORS][ampCompTableSize + 1];
 // Dense LUT: index = integer Hz, value = RANGE PWM. Filled from float quadratic.
-uint16_t ampCompLut[NUM_OSCILLATORS][AMP_COMP_MAX_HZ + 1];
+SRAM_DATA uint16_t ampCompLut[NUM_OSCILLATORS][AMP_COMP_MAX_HZ + 1];
 #endif
 
 // ---------------------------------------------------------------------------
@@ -261,7 +261,7 @@ static void precomputeCoefficients_float() {
   }
 }
 
-uint16_t get_chan_level_float_quad(float freqHz, uint8_t voiceN);
+uint16_t SRAM_HOT(get_chan_level_float_quad)(float freqHz, uint8_t voiceN);
 
 static inline void fill_amp_comp_lut_from_quad() {
   for (uint8_t o = 0; o < NUM_OSCILLATORS; ++o) {
@@ -308,12 +308,12 @@ static inline void precompute_amp_comp_for_engine() {
 // ---------------------------------------------------------------------------
 // Prototypes
 // ---------------------------------------------------------------------------
-uint16_t get_chan_level_lookup_fast(int32_t x, uint8_t voiceN);
+uint16_t SRAM_HOT(get_chan_level_lookup_fast)(int32_t x, uint8_t voiceN);
 #ifdef USE_FLOAT_AMP_COMP
-uint16_t get_chan_level_float_quad(float freqHz, uint8_t voiceN);
-uint16_t get_chan_level_lut(float freqHz, uint8_t voiceN);
+uint16_t SRAM_HOT(get_chan_level_float_quad)(float freqHz, uint8_t voiceN);
+uint16_t SRAM_HOT(get_chan_level_lut)(float freqHz, uint8_t voiceN);
 
-static inline uint16_t get_chan_level_by_method(float freqHz, uint8_t voiceN) {
+static inline uint16_t SRAM_HOT(get_chan_level_by_method)(float freqHz, uint8_t voiceN) {
   switch (amp_comp_method) {
     case AMP_COMP_LUT:
       return get_chan_level_lut(freqHz, voiceN);
@@ -331,12 +331,12 @@ static inline uint16_t get_chan_level_by_method(float freqHz, uint8_t voiceN) {
   }
 }
 
-static inline uint16_t get_chan_level_float(float freqHz, uint8_t voiceN) {
+static inline uint16_t SRAM_HOT(get_chan_level_float)(float freqHz, uint8_t voiceN) {
   return get_chan_level_by_method(freqHz, voiceN);
 }
 #endif
 
-static inline uint16_t get_chan_level_for_engine(float freqHz, uint8_t voiceN) {
+static inline uint16_t SRAM_HOT(get_chan_level_for_engine)(float freqHz, uint8_t voiceN) {
 #ifdef USE_FLOAT_AMP_COMP
   return get_chan_level_by_method(freqHz, voiceN);
 #else

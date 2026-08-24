@@ -227,6 +227,9 @@ void restart_DCO_calibration() {
     }
   }
 
+  Serial.println("Delaying 1 second");
+  delay(1000);
+
   // 2. CONFIGURE PW FOR ACTIVE OSCILLATOR ONLY
   const uint8_t pwCh = cal_pw_channel(currentDCO);
   const bool hasPW = osc_has_pw(currentDCO);

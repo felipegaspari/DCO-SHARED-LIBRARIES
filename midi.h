@@ -8,6 +8,8 @@
  
  #include <MIDI.h>
  
+ extern uint8_t velocity[NUM_VOICES_TOTAL];
+ 
  Adafruit_USBD_MIDI usb_midi;
  
  MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI_USB);

@@ -36,25 +36,25 @@
    return { x, y };
  }
  
- // Función para encontrar el valor de y dado un valor de x en la curva de Bézier
- inline float findYForX(const Point& A, const Point& P1, const Point& P2, const Point& B, float xTarget, float tol = 1e-5f) {
-   float tLow = 0.0f;
-   float tHigh = 1.0f;
-   float tMid;
- 
-   while ((tHigh - tLow) > tol) {
-     tMid = (tLow + tHigh) / 2.0f;
-     Point midPoint = bezierCubic(A, P1, P2, B, tMid);
-     if (midPoint.x < xTarget) {
-       tLow = tMid;
-     } else {
-       tHigh = tMid;
-     }
-   }
- 
-   Point resultPoint = bezierCubic(A, P1, P2, B, tMid);
-   return resultPoint.y;
- }
+// Función para encontrar el valor de y dado un valor de x en la curva de Bézier
+inline float findYForX(const Point& A, const Point& P1, const Point& P2, const Point& B, float xTarget, float tol = 1e-5f) {
+  float tLow = 0.0f;
+  float tHigh = 1.0f;
+  float tMid;
+
+  while ((tHigh - tLow) > tol) {
+    tMid = (tLow + tHigh) / 2.0f;
+    Point midPoint = bezierCubic(A, P1, P2, B, tMid);
+    if (midPoint.x < xTarget) {
+      tLow = tMid;
+    } else {
+      tHigh = tMid;
+    }
+  }
+
+  Point resultPoint = bezierCubic(A, P1, P2, B, tMid);
+  return resultPoint.y;
+}
  
  /**
   * @brief Populates a 4096-entry lookup table for AS2164 VCA linearization using cubic Bézier curves.
@@ -65,12 +65,16 @@
   * @param arraySize Size of lookup array (typically 4096).
   * @param array Reference to the destination array.
   */
- inline void generateBezierArray(Point A, Point B, Point P1, Point P2, uint16_t arraySize, uint16_t (&array)[4096]) {
-   for (int x = 0; x < arraySize; ++x) {
-     float yResult = findYForX(A, P1, P2, B, static_cast<float>(x));
-     array[x] = (uint16_t)yResult;
-   }
- }
+  __attribute__((noinline))
+  inline void generateBezierArray(const Point &A, const Point &B, const Point &P1, const Point &P2, 
+                                  uint16_t arraySize, uint16_t (&array)[4096]) {
+      for (uint16_t x = 0; x < arraySize; ++x) {
+          float yResult = findYForX(A, P1, P2, B, static_cast<float>(x));
+          if (yResult < 0.0f) yResult = 0.0f;
+          if (yResult > 4095.0f) yResult = 4095.0f;
+          array[x] = (uint16_t)(yResult + 0.5f);
+      }
+  }
  
  /**
   * @brief Maps a linear input value to a logarithmic curve.
@@ -95,15 +99,32 @@
   * @param maxValue Maximum mapped output value.
   * @return Scaled exponential output value.
   */
- inline uint16_t linearToExponential(uint16_t linearValue, float base, uint16_t maxValue) {
-   if (linearValue > 4095) linearValue = 4095;
- 
-   float normalizedValue = (float)linearValue / 4095.0f;
-   float expValue = pow(base, normalizedValue) - 1.0f;
-   float maxExpValue = base - 1.0f;
- 
-   return (uint16_t)(expValue * ((float)maxValue / maxExpValue));
- }
+// Fast 2^p approximation (zero libm / zero powf dependency)
+static inline float fast_pow2(float p) {
+  int ipart = (int)p;
+  float f = p - (float)ipart;
+  // 4-term polynomial for 2^f on [0, 1)
+  float exp_f = 1.0f + f * (0.69314718f + f * (0.2402265f + f * (0.0555041f + f * 0.009618f)));
+  return (float)(1 << ipart) * exp_f;
+}
+
+inline uint16_t linearToExponential(uint16_t linearValue, float base, uint16_t maxValue) {
+  if (linearValue > 4095) linearValue = 4095;
+
+  float normalizedValue = (float)linearValue / 4095.0f;
+
+  // base^x = 2^(x * log2(base))
+  float log2_base = 5.643856f; // for base == 50.0f
+  if (base != 50.0f) {
+      float z = (base - 1.0f) / (base + 1.0f);
+      log2_base = 2.88539f * z * (1.0f + z * z * 0.333333f);
+  }
+
+  float expValue = fast_pow2(normalizedValue * log2_base) - 1.0f;
+  float maxExpValue = base - 1.0f;
+
+  return (uint16_t)(expValue * ((float)maxValue / maxExpValue));
+}
  
  /**
   * @brief Quadratic exponential curve mapping returning float: (x^2 / curve).

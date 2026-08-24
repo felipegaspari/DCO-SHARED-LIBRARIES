@@ -24,16 +24,8 @@
 // 0 = portable / flash (library default). No-op if the attribute is missing (AVR).
 // Allocation runs at MIDI rate, so this buys jitter consistency rather than
 // throughput: it keeps a note-on off the XIP cache while Core1 is mid-frame.
-#ifndef VOICE_ALLOC_SRAM_HOT
-#define VOICE_ALLOC_SRAM_HOT 0
-#endif
-#if VOICE_ALLOC_SRAM_HOT
-#ifndef __not_in_flash_func
-#define __not_in_flash_func(fn) fn
-#endif
-#define VOICE_ALLOC_HOT(fn) __not_in_flash_func(fn)
-#else
-#define VOICE_ALLOC_HOT(fn) fn
+#ifndef VOICE_ALLOC_HOT
+#define VOICE_ALLOC_HOT(fn) SRAM_HOT(fn)
 #endif
 
 // Emit active config once per translation unit (visible in the compile log).
@@ -224,7 +216,8 @@ public:
   // Realign the allocation state with the caller's gate flags. A slot that the
   // voice count dropped mid-note would otherwise come back HELD when the count
   // grows again.
-  void resyncFromGates(const volatile uint32_t* gates) {
+  template <typename T>
+  void VOICE_ALLOC_HOT(resyncFromGates)(const volatile T* gates) {
     for (uint8_t i = 0; i < MaxVoices; i++) {
       _state[i] = (gates[i] != 0) ? VOICE_HELD : VOICE_IDLE;
     }
@@ -237,17 +230,21 @@ public:
 #endif
 
 private:
-  // Current EnvVCA level of a voice, used to rank release tails by loudness.
-  // Without a level source, estimate the tail from the release time instead.
-  int16_t ampQ15(uint8_t i, uint32_t now_ms) const {
-    if (_levels) return _levels[i];
-    if (_state[i] != VOICE_RELEASING) return VOICE_ALLOC_Q15_ONE;
-    const uint32_t release_ms = _releaseMs;
-    if (release_ms == 0) return 0;
-    const uint32_t elapsed = now_ms - _releaseAtMs[i];
-    if (elapsed >= release_ms) return 0;
-    return (int16_t)(((uint32_t)VOICE_ALLOC_Q15_ONE * (release_ms - elapsed)) / release_ms);
+// Current EnvVCA level of a voice, used to rank release tails by loudness.
+int16_t VOICE_ALLOC_HOT(ampQ15)(uint8_t i, uint32_t now_ms) const {
+  if (_levels) {
+    int16_t lvl = _levels[i];
+    if (lvl < 0) lvl = 0;
+    if (lvl > VOICE_ALLOC_Q15_ONE) lvl = VOICE_ALLOC_Q15_ONE;
+    return lvl;
   }
+  if (_state[i] != VOICE_RELEASING) return VOICE_ALLOC_Q15_ONE;
+  const uint32_t release_ms = _releaseMs;
+  if (release_ms == 0) return 0;
+  const uint32_t elapsed = now_ms - _releaseAtMs[i];
+  if (elapsed >= release_ms) return 0;
+  return (int16_t)(((uint32_t)VOICE_ALLOC_Q15_ONE * (release_ms - elapsed)) / release_ms);
+}
 
   // Effective state, promoting a release tail that has already faded out to idle.
   uint8_t effectiveState(uint8_t i, uint32_t now_ms) const {
@@ -286,6 +283,7 @@ private:
 
   // Pick the best victim among the candidates flagged in the mask, applying the
   // mode's priority function. The mask always has at least one bit set.
+  // Pick the best victim among the candidates flagged in the mask
   uint8_t VOICE_ALLOC_HOT(pick)(uint8_t mask, uint32_t now_ms) const {
     uint8_t best = VOICE_ALLOC_NONE;
     uint32_t best_key = 0;
@@ -293,23 +291,22 @@ private:
     for (uint8_t i = 0; i < _count; i++) {
       if (!(mask & (1u << i))) continue;
 
-      // Larger key wins, so every term is expressed as "how stealable is this".
       uint32_t key;
       switch (_mode) {
         case VOICE_ALLOC_OLDEST:
           key = ageMs(i, now_ms);
           break;
+
         case VOICE_ALLOC_QUIETEST:
         case VOICE_ALLOC_QUIETEST_KEEP_LOW:
         case VOICE_ALLOC_QUIETEST_KEEP_HIGH: {
-          // Quietest first; age breaks ties, which a held chord sitting at the same
-          // sustain level produces constantly. Clamped rather than masked so a voice
-          // older than the tiebreak range does not wrap back to looking young.
-          const uint32_t age = ageMs(i, now_ms);
-          key = ((uint32_t)(VOICE_ALLOC_Q15_ONE - ampQ15(i, now_ms)) << 8)
-              | (age > 255u ? 255u : age);
+          // Upper 24 bits: Quietest first (lowest amplitude = largest key)
+          // Lower 8 bits:  LRU rank perfectly breaks ties when amplitudes match
+          const uint32_t quietness = (uint32_t)(VOICE_ALLOC_Q15_ONE - ampQ15(i, now_ms));
+          key = (quietness << 8) | (uint32_t)lruRank(i);
           break;
         }
+
         case VOICE_ALLOC_ROUND_ROBIN:
         case VOICE_ALLOC_NO_STEAL:
         default:
