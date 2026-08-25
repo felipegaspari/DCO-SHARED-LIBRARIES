@@ -11,9 +11,9 @@
  
 
  // 1. Envelope Timings & Restarts
- extern uint16_t ADSR_VCA_attack, ADSR_VCA_decay, ADSR_VCA_sustain, ADSR_VCA_release;
- extern uint16_t ADSR_VCF_attack, ADSR_VCF_decay, ADSR_VCF_sustain, ADSR_VCF_release;
- extern bool VCAADSRRestart, VCFADSRRestart;
+ extern uint16_t ADSR1_attack, ADSR1_decay, ADSR1_sustain, ADSR1_release;
+ extern uint16_t ADSR2_attack, ADSR2_decay, ADSR2_sustain, ADSR2_release;
+ extern bool ADSR1_restart, ADSR2_restart, ADSR3_restart;
  
  // 2. Envelope Curves
  extern uint8_t ADSR1AttackCurveVal, ADSR1DecayCurveVal, ADSR1ReleaseCurveVal;
