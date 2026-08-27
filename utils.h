@@ -156,24 +156,36 @@ inline uint16_t linearToExponential(uint16_t linearValue, float base, uint16_t m
    return expValOut;
  }
  
- /**
-  * @brief Fast reciprocal multiplication approximation for expConverterFloat(v, 5000).
-  * @param v Input 32-bit value.
-  * @return Scaled float output.
-  */
- static inline float fast_exp_speed_5000(uint32_t v) {
-   if (v <= 4) return 0.0f;
-   return (float)(v * v) * 0.0002f;
- }
- 
- /**
-  * @brief Fast reciprocal multiplication approximation for LFO depth modulation scaling.
-  * @param v Input 32-bit value.
-  * @return Scaled float modulation depth.
-  */
- static inline float fast_lfo_depth_amt(uint32_t v) {
-   if (v <= 1) return 0.0f;
-   return (float)(v * v) * 7.27272727e-9f;
- }
+/**
+ * @brief Fast reciprocal multiplication approximation for expConverterFloat(v, 5000).
+ * @param v Input 32-bit value.
+ * @return Scaled float output.
+ */
+ static inline float SRAM_HOT(fast_exp_speed_5000)(uint32_t v) {
+  // 1. Calculate the square first (1-cycle integer hardware instruction)
+  uint32_t sq = v * v;
+  
+  // 2. Branchless Selection: The compiler will turn this ternary into an 
+  // ARM 'IT' (If-Then) block. If v <= 4, it instantly overrides 'sq' to 0. 
+  // No branches, no pipeline flushes.
+  sq = (v > 4) ? sq : 0;
+  
+  // 3. Hardware FPU execution. If sq was set to 0, this outputs 0.0f perfectly.
+  return (float)sq * 0.0002f;
+}
+
+/**
+* @brief Fast reciprocal multiplication approximation for LFO depth modulation scaling.
+* @param v Input 32-bit value.
+* @return Scaled float modulation depth.
+*/
+static inline float SRAM_HOT(fast_lfo_depth_amt)(uint32_t v) {
+  uint32_t sq = v * v;
+  
+  // Branchless override for values <= 1
+  sq = (v > 1) ? sq : 0;
+  
+  return (float)sq * 7.27272727e-9f;
+}
  
  #endif // DCO_UTILS_H

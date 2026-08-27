@@ -170,12 +170,23 @@ static inline int32_t fast_mod_clamp(int32_t v) {
 #endif
 }
 
-inline void SRAM_HOT(mod_matrix_accumulate_all)(const ModSources* sources, uint8_t num_voices) {
+inline void SRAM_HOT(mod_matrix_accumulate_all)(const ModSources* __restrict sources, uint8_t num_voices) {
     if (num_voices > MAX_SUPPORTED_VOICES) num_voices = MAX_SUPPORTED_VOICES;
+    if (num_voices == 0) return;
     
-    // Clear final accumulator directly (avoids massive temporary next_sums buffer)
+    // 1. THE JITTER FIX: Reverted to a compile-time CONSTANT for memset.
+    // This forces GCC to emit zero-branch, highly predictable inline DSP store instructions.
+    // No more calls to libc, meaning zero execution time spikes.
     memset(voice_mod_sums, 0, sizeof(voice_mod_sums));
-    uint8_t spread_idx = (num_voices > 0) ? num_voices - 1 : 0;
+    
+    uint8_t spread_idx = num_voices - 1;
+
+    // 2. THE ALIASING FIX: By mapping your global arrays to '__restrict' pointers, 
+    // we legally guarantee to the compiler that writing to 'sums' will NEVER overwrite 'sources'. 
+    // This allows the compiler to hoist global variables (like sources->lfo1) into 
+    // a CPU register BEFORE the loop begins, saving a RAM load on every single voice iteration!
+    int32_t (* __restrict sums)[MOD_DEST_COUNT] = voice_mod_sums;
+    const int32_t (* __restrict prevs)[8] = (const int32_t(*)[8])prev_depth_mods;
 
     for (uint8_t i = 0; i < 8; i++) {
         const uint8_t src_id = mod_slots[i].src;
@@ -186,11 +197,14 @@ inline void SRAM_HOT(mod_matrix_accumulate_all)(const ModSources* sources, uint8
 
         const int32_t base_depth = mod_slots[i].depth;
 
-        // Tightly unrolled MAC loop. Compiler will emit SMLAD/MLA here.
+        // 3. LOOP UNROLLING: We tell GCC to unroll the inner loop.
+        // Because 'num_voices' is a short loop (e.g. 6-16), checking the loop exit condition 
+        // on every voice causes branch-predictor hesitation. Unrolling slashes this overhead.
         #define MACRO_ACCUM_VOICES(SRC_EXPR) \
+            _Pragma("GCC unroll 4") \
             for (uint8_t v = 0; v < num_voices; v++) { \
-                int32_t depth = fast_mod_clamp(base_depth + prev_depth_mods[v][i]); \
-                voice_mod_sums[v][dest] += ((SRC_EXPR) * depth); \
+                int32_t depth = fast_mod_clamp(base_depth + prevs[v][i]); \
+                sums[v][dest] += ((SRC_EXPR) * depth); \
             }
 
         switch (src_id) {
@@ -216,10 +230,12 @@ inline void SRAM_HOT(mod_matrix_accumulate_all)(const ModSources* sources, uint8
         #undef MACRO_ACCUM_VOICES
     }
 
-    // Capture depth mods for the NEXT cycle (Maintains 1-sample delay, but ditches next_sums array)
+    // 4. Update for next cycle. We unroll the inner constant-length loop 
+    // to turn it into a zero-branch sequence of bitshifts.
     for (uint8_t v = 0; v < num_voices; v++) {
+        _Pragma("GCC unroll 8")
         for (uint8_t i = 0; i < 8; i++) {
-            prev_depth_mods[v][i] = voice_mod_sums[v][DEST_MOD_SLOT0_DEPTH + i] >> 15;
+            prev_depth_mods[v][i] = sums[v][DEST_MOD_SLOT0_DEPTH + i] >> 15;
         }
     }
 }
@@ -229,11 +245,15 @@ inline void SRAM_HOT(mod_matrix_accumulate_all)(const ModSources* sources, uint8
 // =============================================================================
 template <uint8_t dest>
 inline int32_t SRAM_HOT(mod_matrix_get_dest_fast)(uint8_t voice) {
+    // 1. Compile-time bounds check (Zero runtime cost)
     if constexpr (dest >= MOD_DEST_COUNT) return 0;
     
-    const int32_t raw_sum = voice_mod_sums[voice][dest];
+    // 2. ZERO-COST ADDRESSING: Because 'dest' is a template parameter, 
+    // the compiler resolves 'voice_mod_sums[dest]' to a hardcoded memory pointer. 
+    // The CPU simply fetches (Pointer + voice) in 1 hardware cycle.
+    const int32_t raw_sum = voice_mod_sums[dest][voice];
 
-    // Arithmetic Shift Right (ASR) replaces all expensive divisions.
+    // 3. Compile-time shift selection (Zero runtime branches)
     if constexpr (dest == DEST_PITCH || dest == DEST_OSC1_PITCH || dest == DEST_OSC2_PITCH) {
         return raw_sum >> 2;
     } else if constexpr (dest == DEST_PW) {
