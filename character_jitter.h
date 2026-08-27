@@ -37,15 +37,17 @@
   */
  static inline int32_t character_pitch_delta_q24(void) {
    const int32_t s = char_pitch_scale_q15;
+   const int32_t local_noise = (int32_t)noiseLevel[1];
    if (!s) return 0;
-   return (int32_t)(((int64_t)(int32_t)noiseLevel[1] * s) >> 15);
+   return (int32_t)(((int64_t)(int32_t)local_noise * s) >> 15);
  }
  
  /**
   * @brief Computes amplitude compensation PWM count delta from white noise (noise0).
   */
  static inline int32_t character_amp_delta(void) {
-   return ((int32_t)noiseLevel[0] * char_amp_scale_q15) >> 15;
+  const int32_t local_noise = (int32_t)noiseLevel[0];
+   return ((int32_t)local_noise * char_amp_scale_q15) >> 15;
  }
  
  /**
@@ -62,8 +64,9 @@
   */
  static inline int32_t character_pw_delta(void) {
    const int32_t s = char_pw_scale_q15;
+   const int32_t local_noise = (int32_t)noiseLevel[0];
    if (!s) return 0;
-   return ((int32_t)noiseLevel[0] * s) >> 15;
+   return ((int32_t)local_noise * s) >> 15;
  }
  
  #endif  // DCO_CHARACTER_JITTER_H

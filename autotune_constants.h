@@ -59,6 +59,7 @@ struct CalPrecisionProfile {
   double   pwDutyTol;           // PW target duty tolerance (e.g. 0.01 = 1.0%)
   uint8_t  pwConfirmReads;      // Number of reads averaged during confirmation & neighborhood sweep
   bool     pwNeighborhoodSweep; // Enable 5-point local neighborhood refinement (±2 counts)
+  uint16_t pwSettleMinMs;
 };
 
 // Fast build: rapid testing tables (PW tolerance = 1.0%)
@@ -82,12 +83,13 @@ constexpr CalPrecisionProfile kCalPrecisionFast = {
   /* pwDutyTol           */ 0.010,  // ±1.0% duty tolerance (FAST)
   /* pwConfirmReads      */ 1,      // 1-shot confirmation
   /* pwNeighborhoodSweep */ false,  // Skip Stage 2 for rapid execution
+  /* pwSettleMinMs       */ 6,       // ms minimum settle time
 };
 
 // Normal build: scratch build balanced for speed & accuracy
 constexpr CalPrecisionProfile kCalPrecisionNormal = {
   /* gapSamplesMin       */ 6,
-  /* gapSamplesMax       */ 64,
+  /* gapSamplesMax       */ 32,
   /* gapWindowMs         */ 25,
   /* gapMaxWindowMs      */ 300,
   /* settlePeriods       */ 1.0f,
@@ -97,7 +99,7 @@ constexpr CalPrecisionProfile kCalPrecisionNormal = {
   /* bisectIters         */ 24,
   /* bisectWindows       */ 2,
   /* confirmReads        */ 2,
-  /* confirmRounds       */ 2,
+  /* confirmRounds       */ 1,
   /* anchorTries         */ 2,
   /* rungRetries         */ 1,
   /* settleMaxChecks     */ 1,
@@ -105,6 +107,7 @@ constexpr CalPrecisionProfile kCalPrecisionNormal = {
   /* pwDutyTol           */ 0.0025, // ±0.25% duty tolerance (NORMAL)
   /* pwConfirmReads      */ 2,      // 2-read confirmation
   /* pwNeighborhoodSweep */ true,   // Full 5-point sweep
+  /* pwSettleMinMs       */ 6,       // ms minimum settle time
 };
 
 // Fine build: highest quality refinement / verification pass
@@ -128,6 +131,7 @@ constexpr CalPrecisionProfile kCalPrecisionFine = {
   /* pwDutyTol           */ 0.0010, // ±0.10% duty tolerance (REFINE)
   /* pwConfirmReads      */ 5,      // 5-read deep confirmation
   /* pwNeighborhoodSweep */ true,   // Full 5-point sweep
+  /* pwSettleMinMs       */ 6,       // ms minimum settle time
 };
 
 // =============================================================================
@@ -173,8 +177,8 @@ constexpr int      kMaxSearchTimeouts      = 6;
 
 // Pulse Width Calibration Targets
 constexpr double kPWCenterDutyFraction = 0.50;
-constexpr double kPWLowDutyFraction    = 0.02;
-constexpr double kPWHighDutyFraction   = 0.98;
+constexpr double kPWLowDutyFraction    = 0.04;
+constexpr double kPWHighDutyFraction   = 0.96;
 constexpr double kPWLimitDutyTolerance = 0.01; // ±1%
 
 #endif  // __AUTOTUNE_CONSTANTS_H__

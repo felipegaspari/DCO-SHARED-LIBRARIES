@@ -9,7 +9,6 @@
 // CC_LOCAL_FIRST are block values that midi_cc_apply() writes directly.
 
 #include <stddef.h>
-//#include "../params_def.h"
 #include "midi_cc.h"
 
 static const MidiCcEntry midiCcMap[] = {
@@ -55,8 +54,8 @@ static const MidiCcEntry midiCcMap[] = {
   {  28, PARAM_ADSR1_DECAY_CURVE,          0,   127, MIDI_CC_LINEAR },
   {  29, PARAM_ADSR2_ATTACK_CURVE,         0,   127, MIDI_CC_LINEAR },
   {  30, PARAM_ADSR2_DECAY_CURVE,          0,   127, MIDI_CC_LINEAR },
-  {  31, PARAM_ADSR1_RESTART,           0,     1, MIDI_CC_LINEAR },
-  {  33, PARAM_ADSR2_RESTART,           0,     1, MIDI_CC_LINEAR },
+  {  31, PARAM_ADSR1_RESTART,              0,     1, MIDI_CC_LINEAR },
+  {  33, PARAM_ADSR2_RESTART,              0,     1, MIDI_CC_LINEAR },
   {  34, CC_LOCAL_ADSR_VCA_ATTACK,         0,  4095, MIDI_CC_EXP_TIME },
   {  35, CC_LOCAL_ADSR_VCA_DECAY,          0,  4095, MIDI_CC_EXP_TIME },
   {  36, CC_LOCAL_ADSR_VCA_SUSTAIN,        0,  4095, MIDI_CC_LINEAR },

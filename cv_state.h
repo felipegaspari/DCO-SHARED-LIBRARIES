@@ -46,7 +46,7 @@
  extern uint16_t AS2164_VCA_linearize_table[4096];
  
  // 6. Mixer Levels
- extern const uint16_t lin_to_log_128[129];
+ extern uint16_t lin_to_log_128[129];
  extern int16_t OSC1LevelVal, OSC2LevelVal, OSC3LevelVal, SubLevelVal;
  extern uint16_t OSC1Level, OSC2Level, OSC3Level, SubLevel;
  extern bool ADSR3Enabled;

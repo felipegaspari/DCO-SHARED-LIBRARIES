@@ -11,6 +11,32 @@
 #include <math.h>
 #include <stdint.h>
 
+#include "hardware/irq.h"
+#include "hardware/structs/sio.h"
+#include "pico/multicore.h"
+
+// ==============================================================================
+// Hardware SIO Inter-Core Command Tokens
+// ==============================================================================
+
+extern volatile bool calibrationFlag;
+extern volatile bool manualCalibrationFlag;
+extern volatile bool firstTuneFlag;
+extern volatile bool calibrationCancelRequested;
+extern volatile bool calibrationVerifyRequested;
+
+enum SioCalCommand : uint32_t {
+  SIO_CMD_CALIBRATE = 0xCA11B001,
+  SIO_CMD_VERIFY    = 0xCA11B002,
+};
+
+void core0_request_calibration();
+void core0_request_verify_sweep();
+void core0_request_calibration_stop();
+
+// Core 1 interrupt init
+void init_core1_cal_interrupt();
+
 // =============================================================================
 // Calibration Enums & Scope Selectors
 // =============================================================================
@@ -105,11 +131,16 @@ struct PWSearchResult {
 // =============================================================================
 // Global State Declarations (extern)
 // =============================================================================
-
-extern bool calibrationFlag;
-extern bool manualCalibrationFlag;
-extern bool firstTuneFlag;
+// Cross-core / ISR handshake flags (ONLY THESE ARE VOLATILE)
+extern volatile bool calibrationFlag;
+extern volatile bool manualCalibrationFlag;
+extern volatile bool firstTuneFlag;
 extern volatile bool calibrationCancelRequested;
+extern volatile bool calibrationVerifyRequested;
+extern volatile bool pwCvProbeRequested;
+extern volatile bool calSyncNeutralRequested;
+extern volatile uint16_t ampCompCalibrationVal;
+// =============================================================================
 
 extern uint8_t calibrationScope;
 extern uint8_t calibrationPrecision;
@@ -131,15 +162,11 @@ extern int calReportAnchorPair;
 extern uint32_t calRunProbes;
 extern unsigned long calRunStartMs;
 
-extern volatile bool calibrationVerifyRequested;
-extern volatile bool pwCvProbeRequested;
 extern uint8_t manualCalSavedSyncMode;
 extern uint8_t manualCalSavedSoftSyncChunks;
-extern volatile bool calSyncNeutralRequested;
 
 extern uint8_t currentDCO;
 extern unsigned long DCOCalibrationStart;
-extern volatile uint16_t ampCompCalibrationVal;
 extern float calibrationFreqHz;
 extern float gapGateFreqHz;
 extern float g_lastDrivenFreqHz;
@@ -148,7 +175,7 @@ constexpr uint16_t initManualAmpCompCalibrationValPreset =
     (uint16_t)(35u * DIV_COUNTER / 14000u);
 
 extern uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
-extern volatile uint16_t ampCompLowestFreqVal;
+extern uint16_t ampCompLowestFreqVal;
 extern uint8_t DCO_calibration_current_note;
 extern byte autotuneDebug;
 
@@ -410,45 +437,36 @@ get_PW_level_interpolated(uint16_t PWval, uint8_t oscN, float noteFreqHz = 0.0f,
   int32_t center, lowLim, highLim;
 
   if (noteFreqHz <= 0.0f) {
-    center = (int32_t)PW_CAL_LIMITS[ch][1].center;
-    lowLim = (int32_t)PW_CAL_LIMITS[ch][1].lowLimit;
+    center  = (int32_t)PW_CAL_LIMITS[ch][1].center;
+    lowLim  = (int32_t)PW_CAL_LIMITS[ch][1].lowLimit;
     highLim = (int32_t)PW_CAL_LIMITS[ch][1].highLimit;
   } else if (noteFreqHz < cache.f0) {
     float t = noteFreqHz / cache.f0;
-    if (t > 1.0f)
-      t = 1.0f;
-    center = (int32_t)PW_CAL_LIMITS[ch][0].center;
-    lowLim = (int32_t)(t * PW_CAL_LIMITS[ch][0].lowLimit);
+    if (t > 1.0f) t = 1.0f;
+    if (t < 0.0f) t = 0.0f;
+
+    center  = (int32_t)PW_CAL_LIMITS[ch][0].center;
+    
+    // 1. CLAMP LOW LIMIT: Protect against the bottom dead zone cliff (stays >= Point 0 floor)
+    lowLim  = (int32_t)PW_CAL_LIMITS[ch][0].lowLimit; 
+    
+    // 2. EXPAND HIGH LIMIT: Allow 98% duty reference to track up toward pwMax (1023) at low frequencies
     highLim = (int32_t)(pwMax + t * (PW_CAL_LIMITS[ch][0].highLimit - pwMax));
   } else if (noteFreqHz <= cache.f1) {
     float t = (noteFreqHz - cache.f0) * cache.invSpan01;
-    if (t > 1.0f)
-      t = 1.0f;
-    center = (int32_t)(PW_CAL_LIMITS[ch][0].center +
-                       t * (PW_CAL_LIMITS[ch][1].center -
-                            PW_CAL_LIMITS[ch][0].center));
-    lowLim = (int32_t)(PW_CAL_LIMITS[ch][0].lowLimit +
-                       t * (PW_CAL_LIMITS[ch][1].lowLimit -
-                            PW_CAL_LIMITS[ch][0].lowLimit));
-    highLim = (int32_t)(PW_CAL_LIMITS[ch][0].highLimit +
-                        t * (PW_CAL_LIMITS[ch][1].highLimit -
-                             PW_CAL_LIMITS[ch][0].highLimit));
+    if (t > 1.0f) t = 1.0f;
+    center  = (int32_t)(PW_CAL_LIMITS[ch][0].center  + t * (PW_CAL_LIMITS[ch][1].center  - PW_CAL_LIMITS[ch][0].center));
+    lowLim  = (int32_t)(PW_CAL_LIMITS[ch][0].lowLimit  + t * (PW_CAL_LIMITS[ch][1].lowLimit  - PW_CAL_LIMITS[ch][0].lowLimit));
+    highLim = (int32_t)(PW_CAL_LIMITS[ch][0].highLimit + t * (PW_CAL_LIMITS[ch][1].highLimit - PW_CAL_LIMITS[ch][0].highLimit));
   } else if (noteFreqHz < cache.f2) {
     float t = (noteFreqHz - cache.f1) * cache.invSpan12;
-    if (t > 1.0f)
-      t = 1.0f;
-    center = (int32_t)(PW_CAL_LIMITS[ch][1].center +
-                       t * (PW_CAL_LIMITS[ch][2].center -
-                            PW_CAL_LIMITS[ch][1].center));
-    lowLim = (int32_t)(PW_CAL_LIMITS[ch][1].lowLimit +
-                       t * (PW_CAL_LIMITS[ch][2].lowLimit -
-                            PW_CAL_LIMITS[ch][1].lowLimit));
-    highLim = (int32_t)(PW_CAL_LIMITS[ch][1].highLimit +
-                        t * (PW_CAL_LIMITS[ch][2].highLimit -
-                             PW_CAL_LIMITS[ch][1].highLimit));
+    if (t > 1.0f) t = 1.0f;
+    center  = (int32_t)(PW_CAL_LIMITS[ch][1].center  + t * (PW_CAL_LIMITS[ch][2].center  - PW_CAL_LIMITS[ch][1].center));
+    lowLim  = (int32_t)(PW_CAL_LIMITS[ch][1].lowLimit  + t * (PW_CAL_LIMITS[ch][2].lowLimit  - PW_CAL_LIMITS[ch][1].lowLimit));
+    highLim = (int32_t)(PW_CAL_LIMITS[ch][1].highLimit + t * (PW_CAL_LIMITS[ch][2].highLimit - PW_CAL_LIMITS[ch][1].highLimit));
   } else {
-    center = (int32_t)PW_CAL_LIMITS[ch][2].center;
-    lowLim = (int32_t)PW_CAL_LIMITS[ch][2].lowLimit;
+    center  = (int32_t)PW_CAL_LIMITS[ch][2].center;
+    lowLim  = (int32_t)PW_CAL_LIMITS[ch][2].lowLimit;
     highLim = (int32_t)PW_CAL_LIMITS[ch][2].highLimit;
   }
 
@@ -467,10 +485,8 @@ get_PW_level_interpolated(uint16_t PWval, uint8_t oscN, float noteFreqHz = 0.0f,
     }
   }
 
-  if (out < 0)
-    return 0;
-  if (out > DIV_COUNTER_PW)
-    return DIV_COUNTER_PW;
+  if (out < 0) return 0;
+  if (out > DIV_COUNTER_PW) return DIV_COUNTER_PW;
   return (uint16_t)out;
 }
 
@@ -501,18 +517,15 @@ inline uint16_t get_PW_level_interpolated(
     lowLim = (int32_t)PW_CAL_LIMITS[ch][1].lowLimit;
     highLim = (int32_t)PW_CAL_LIMITS[ch][1].highLimit;
   } else if (noteFreqQ24 < (int64_t)cache.f0) {
-    // Rapid 32-bit SIO Hardware Division downshift (8 cycles, no 64-bit
-    // overhead)
-    uint32_t f_q10 = (uint32_t)(noteFreqQ24 >> 14);
+    uint32_t f_q10  = (uint32_t)(noteFreqQ24 >> 14);
     uint32_t f0_q10 = (uint32_t)(((int64_t)cache.f0) >> 14);
-    uint32_t t_q15 = (f0_q10 > 0) ? ((f_q10 << 15) / f0_q10) : 0;
-    if (t_q15 > 32768)
-      t_q15 = 32768;
+    uint32_t t_q15  = (f0_q10 > 0) ? ((f_q10 << 15) / f0_q10) : 0;
+    if (t_q15 > 32768) t_q15 = 32768;
 
-    center = (int32_t)PW_CAL_LIMITS[ch][0].center;
-    lowLim = (int32_t)((t_q15 * PW_CAL_LIMITS[ch][0].lowLimit) >> 15);
+    center  = (int32_t)PW_CAL_LIMITS[ch][0].center;
+    lowLim  = (int32_t)PW_CAL_LIMITS[ch][0].lowLimit; // Protected bottom clamp
     int32_t highDiff = pwMax - (int32_t)PW_CAL_LIMITS[ch][0].highLimit;
-    highLim = pwMax - (int32_t)((t_q15 * highDiff) >> 15);
+    highLim = pwMax - (int32_t)((t_q15 * highDiff) >> 15); // Upward expansion for 98% precision
   } else if (noteFreqQ24 <= (int64_t)cache.f1) {
     uint32_t deltaF = (uint32_t)(noteFreqQ24 - cache.f0);
     uint32_t t_q15 = (uint32_t)(((uint64_t)deltaF * cache.invSpan01_q24) >> 16);

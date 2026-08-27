@@ -966,7 +966,7 @@ struct FreqTraceProbeInfo {
   int   probes;
   int   settleChecks;
 };
-
+/* ORIGINAL EXCELLENT WORKING FUNCTION, REPLACED WITH NEW ONE BELOW
 bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   constexpr int numPairs  = (int)(chanLevelVoiceDataSize / 2);
   constexpr int firstRung = 1;
@@ -1023,14 +1023,22 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   freq_trace_quality(anchorGapUs, anchorFreq, g_lastFreqBisectProbes, g_lastSettleChecks));
 
   // 2. Manual Trim Point Measurement
+  // SURGICAL FIX: Extract manual baseline values so they can be explicitly bound to Pair 1
+  uint16_t manualAmp;
+  float manualFreq;
+  float manualGapUs;
   {
-    int32_t manualAmp = (int32_t)ctx.initManualAmpByOsc[ctx.dcoIndex] + (int32_t)ctx.manualOffsetByOsc[ctx.dcoIndex];
-    if (manualAmp < 1) manualAmp = 1;
-    if (manualAmp > (int32_t)DIV_COUNTER) manualAmp = (int32_t)DIV_COUNTER;
+    int32_t manualAmp32 = (int32_t)ctx.initManualAmpByOsc[ctx.dcoIndex] + (int32_t)ctx.manualOffsetByOsc[ctx.dcoIndex];
+    if (manualAmp32 < 1) manualAmp32 = 1;
+    if (manualAmp32 > (int32_t)DIV_COUNTER) manualAmp32 = (int32_t)DIV_COUNTER;
+    manualAmp = (uint16_t)manualAmp32;
+
     float nominalHz = note_to_freq(manual_DCO_calibration_start_note);
-    float found = find_freq_for_duty50((uint16_t)manualAmp, nominalHz, kManualNoteWindowRatio, true);
+    manualFreq = find_freq_for_duty50(manualAmp, nominalHz, kManualNoteWindowRatio, true);
+    manualGapUs = g_lastFreqBisectGapUs;
+
     if (calibrationCancelRequested) return false;
-    if (found > 0.0f) add_known(found, (float)manualAmp);
+    if (manualFreq > 0.0f) add_known(manualFreq, (float)manualAmp);
   }
 
   // 3. Anchor Refinement
@@ -1165,18 +1173,24 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
 
   // 7. Trace Downward
   int lowestTraced = anchorPair;
-  for (int p = anchorPair - 1; p >= firstRung; --p) {
+  // SURGICAL FIX: Trace down to 2 instead of 1, reserving Pair 1 for the manual baseline
+  for (int p = anchorPair - 1; p >= 2; --p) {
     if (calibrationCancelRequested) return false;
     float fTarget = anchorFreq * powf(ladderRatio, (float)(p - anchorPair));
     float ampGuess = freq_trace_guess(knownFreq, knownAmp, knownCount, fTarget);
     int32_t ampFixed = (int32_t)(ampGuess + 0.5f);
     if (ampFixed >= (int32_t)ampByPair[p + 1]) ampFixed = (int32_t)ampByPair[p + 1] - 1;
-    if (ampFixed < 1) break;
+    
+    // SURGICAL FIX: Stop trace if the amplitude or frequency gets too close to the manual baseline
+    if (ampFixed <= manualAmp) break;
 
     float fGuess = freq_trace_guess(knownAmp, knownFreq, knownCount, (float)ampFixed);
     if (fGuess <= 0.0f) fGuess = freqByPair[p + 1] * ((float)ampFixed / (float)ampByPair[p + 1]);
 
     float found = find_freq_for_duty50((uint16_t)ampFixed, fGuess, ladderRatio, true);
+    
+    // SURGICAL FIX: Guard against merging into manual baseline
+    if (found <= manualFreq * 1.05f) break; 
     if (found <= 0.0f) break;
 
     add_known(found, (float)ampFixed);
@@ -1189,6 +1203,11 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   }
 
   if (calibrationCancelRequested) return false;
+
+  // SURGICAL FIX: Explicitly map Pair 1 to the manual trimpot baseline
+  freqByPair[1] = manualFreq;
+  ampByPair[1]  = manualAmp;
+  cal_report_set_pair_from_gap(1, manualGapUs, manualFreq, CAL_SRC_MANUAL);
 
   // 8. Full-Amp Endpoint
   int topPair = (highestTraced < lastRung) ? (highestTraced + 1) : (numPairs - 1);
@@ -1224,8 +1243,10 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     cal_report_set_pair(q, kCalDutyErrUnknown, CAL_SRC_SENTINEL);
   }
 
-  // 9. Amp-0 Bottom Endpoint
-  FreqSearchBounds f0Bounds = amp0_search_band(freqByPair[lowestTraced]);
+// 9. Amp-0 Bottom Endpoint
+  // Base the Amp-0 boundary on Pair 1 (the manual baseline) 
+  // so Pair 0 is mathematically forced to be lower than it.
+  FreqSearchBounds f0Bounds = amp0_search_band(freqByPair[1]);
   float f0Model = amp0_fit_freq(knownAmp, knownFreq, knownCount);
   if (!(f0Model > 0.0f)) f0Model = freq_trace_guess(knownAmp, knownFreq, knownCount, 0.0f);
 
@@ -1257,12 +1278,19 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     }
   }
 
-  // Linear Fill Below Lowest Traced Rung
-  for (int q = lowestTraced - 1; q >= firstRung; --q) {
-    float frac = (float)q / (float)lowestTraced;
-    freqByPair[q] = f0Est + (freqByPair[lowestTraced] - f0Est) * frac;
-    ampByPair[q]  = (uint16_t)((float)ampByPair[lowestTraced] * frac + 0.5f);
-    cal_report_set_pair(q, kCalDutyErrUnknown, CAL_SRC_FILLED);
+  // SURGICAL FIX: Linear Fill Below Lowest Traced Rung down to Pair 2 (bridging lowestTraced to Pair 1)
+  if (lowestTraced > 2) {
+    float logF1 = logf(freqByPair[1]);
+    float logFL = logf(freqByPair[lowestTraced]);
+    float amp1  = (float)ampByPair[1];
+    float ampL  = (float)ampByPair[lowestTraced];
+    
+    for (int q = lowestTraced - 1; q >= 2; --q) {
+      float frac = (float)(q - 1) / (float)(lowestTraced - 1);
+      freqByPair[q] = expf(logF1 + frac * (logFL - logF1));
+      ampByPair[q]  = (uint16_t)(amp1 + frac * (ampL - amp1) + 0.5f);
+      cal_report_set_pair(q, kCalDutyErrUnknown, CAL_SRC_FILLED);
+    }
   }
 
   // 10. Commit to Buffer & Sanity Check
@@ -1274,8 +1302,247 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   }
 
   return cal_table_is_monotonic(ctx.calibrationData, numPairs, ctx.dcoIndex, "FREQ_TRACE_ERROR");
-}
+}*/
 
+/**
+ * @file autotune_search_impl.h
+ * @brief Unbroken Geometric Amplitude Ladder with Polynomial Frequency Approximation.
+ */
+
+ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
+  constexpr int numPairs  = (int)(chanLevelVoiceDataSize / 2); // 22 pairs total (0..21)
+  constexpr int topPair   = 20;                               // Pair 20 is 14000 counts
+  constexpr int kMaxKnown = numPairs + 8;
+  const float   r         = calibration_interval_ratio();
+
+  float knownFreq[kMaxKnown];
+  float knownAmp[kMaxKnown];
+  int   knownCount = 0;
+
+  auto add_known = [&](float f, float a) {
+    if (knownCount < kMaxKnown) {
+      knownFreq[knownCount] = f; knownAmp[knownCount] = a; ++knownCount;
+    }
+  };
+
+  float    freqByPair[numPairs];
+  uint16_t ampByPair[numPairs];
+
+  // =========================================================================
+  // 1. 440 Hz REFERENCE PROBE (Point 1 of 4: Scale Scaffolding)
+  // =========================================================================
+  uint16_t anchorAmp = ampComp440[ctx.dcoIndex];
+  uint8_t  pwCh      = cal_pw_channel(ctx.dcoIndex);
+
+  Serial.println((String)"[FREQ_TRACE_INIT] DCO=" + ctx.dcoIndex +
+  " Recalled anchorAmp=" + anchorAmp +
+  " | PW Channel=" + pwCh + " (GP" + PW_PINS[pwCh] +
+  ") PW_CENTER=" + PW_CENTER[pwCh] +
+  " (Hardware Readback CC=" + pw_level_readback(pwCh) + ")");
+
+  if (anchorAmp == 0) {
+    Serial.println((String)"[FREQ_TRACE_GUARD] DCO=" + ctx.dcoIndex +
+    " 440 Hz anchor is 0! Run manual step 2 first.");
+    return false;
+  }
+
+  float anchorFreq = find_freq_for_duty50(
+    anchorAmp, note_to_freq(manual_cal_reference_note),
+    kAnchorAcquireWindowRatio, true);
+
+  if (calibrationCancelRequested || anchorFreq <= 0.0f) {
+    Serial.println((String)"[FREQ_TRACE_GUARD] DCO=" + ctx.dcoIndex +
+    " No signal at manual anchor amp=" + anchorAmp +
+    " PW_raw=" + pw_level_readback(pwCh) +
+    " (center=" + PW_CENTER[pwCh] + "); aborting.");
+    return false;
+  }
+
+  add_known(anchorFreq, (float)anchorAmp); // Point 1 of 4
+  float anchorGapUs = g_lastFreqBisectGapUs;
+  Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
+  " Reference acquired: AMP=" + anchorAmp + " Freq=" + fmt_freq(anchorFreq) + " Hz" +
+  freq_trace_quality(anchorGapUs, anchorFreq, g_lastFreqBisectProbes, g_lastSettleChecks));
+
+  // =========================================================================
+  // 2. MANUAL LOW BASELINE PROBE (Point 2 of 4: Low Anchor / Pair 1)
+  // =========================================================================
+  uint16_t manualAmp;
+  float    manualFreq;
+  float    manualGapUs;
+  {
+    int32_t manualAmp32 = (int32_t)ctx.initManualAmpByOsc[ctx.dcoIndex] + (int32_t)ctx.manualOffsetByOsc[ctx.dcoIndex];
+    if (manualAmp32 < 1) manualAmp32 = 1;
+    if (manualAmp32 >= (int32_t)anchorAmp) manualAmp32 = (int32_t)anchorAmp - 1;
+    manualAmp = (uint16_t)manualAmp32;
+
+    float nominalHz = note_to_freq(manual_DCO_calibration_start_note);
+    manualFreq = find_freq_for_duty50(manualAmp, nominalHz, kManualNoteWindowRatio, true);
+    manualGapUs = g_lastFreqBisectGapUs;
+
+    if (calibrationCancelRequested || manualFreq <= 0.0f) {
+      Serial.println((String)"[FREQ_TRACE_GUARD] DCO=" + ctx.dcoIndex + " No signal at manual base amp=" + manualAmp);
+      return false;
+    }
+    
+    add_known(manualFreq, (float)manualAmp); // Point 2 of 4
+    Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex + " Manual Base acquired: AMP=" + manualAmp + " Freq=" + fmt_freq(manualFreq) + " Hz");
+  }
+
+  // =========================================================================
+  // 3. 440 Hz REFERENCE REFINEMENT (Fine-tunes the physical model)
+  // =========================================================================
+  {
+    float target440 = note_to_freq(manual_cal_reference_note);
+    uint16_t storedAmp = anchorAmp;
+    float cents = 1200.0f * log2f(anchorFreq / target440);
+    int tries = cal_precision().anchorTries;
+
+    for (int attempt = 0; attempt < tries && fabsf(anchorFreq - target440) > 0.1f; ++attempt) {
+      if (calibrationCancelRequested) return false;
+      float ampGuess = freq_trace_guess(knownFreq, knownAmp, knownCount, target440);
+      int32_t ampNext = (int32_t)lroundf(ampGuess);
+      if (ampNext < 1) ampNext = 1;
+      if (ampNext > (int32_t)DIV_COUNTER) ampNext = (int32_t)DIV_COUNTER;
+      if (ampNext == (int32_t)anchorAmp) ampNext += (anchorFreq < target440) ? 1 : -1;
+      if (ampNext < 1 || ampNext > (int32_t)DIV_COUNTER) break;
+
+      float found = find_freq_for_duty50((uint16_t)ampNext, target440, kAnchorWindowRatio, true);
+      if (found <= 0.0f) break;
+      add_known(found, (float)ampNext);
+
+      float newCents = 1200.0f * log2f(found / target440);
+      if (fabsf(newCents) < fabsf(cents)) {
+        anchorAmp = (uint16_t)ampNext; anchorFreq = found; anchorGapUs = g_lastFreqBisectGapUs; cents = newCents;
+      }
+    }
+
+    if (anchorAmp != storedAmp) {
+      ampComp440[ctx.dcoIndex] = anchorAmp;
+      update_FS_AmpComp440(ctx.dcoIndex, anchorAmp);
+    }
+  }
+
+  // =========================================================================
+  // 4. BOOTSTRAP PROBES AROUND 440 Hz (Points 3 & 4 for lsq_quadratic Matrix)
+  // =========================================================================
+  {
+    int nBootstrap = (calibrationPrecision == CAL_PRECISION_FAST) ? 2 : 4;
+    for (int b = 0; b < nBootstrap; ++b) {
+      if (calibrationCancelRequested) return false;
+      int32_t amp = lroundf((float)anchorAmp * exp2f((float)kBootstrapSemitones[b] / 12.0f));
+      if (amp <= (int32_t)manualAmp || amp >= (int32_t)DIV_COUNTER || amp == (int32_t)anchorAmp) continue;
+
+      float fSeed = freq_trace_guess(knownAmp, knownFreq, knownCount, (float)amp);
+      if (fSeed <= 0.0f) fSeed = anchorFreq;
+      float fFound = find_freq_for_duty50((uint16_t)amp, fSeed, r, true);
+      if (fFound > 0.0f) add_known(fFound, (float)amp); // Points 3 & 4 added here
+    }
+  }
+
+  // =========================================================================
+  // 5. GENERATE UNBROKEN GEOMETRIC AMPLITUDE LADDER (Pairs 1 to 20)
+  // =========================================================================
+  // A single, continuous geometric progression from manualAmp to 14000 (No split ratios!)
+  freqByPair[1] = manualFreq;
+  ampByPair[1]  = manualAmp;
+  cal_report_set_pair_from_gap(1, manualGapUs, manualFreq, CAL_SRC_MANUAL);
+
+  float rTotal = powf((float)DIV_COUNTER / (float)manualAmp, 1.0f / (float)(topPair - 1));
+  for (int p = 2; p < topPair; ++p) {
+    ampByPair[p] = (uint16_t)lroundf((float)manualAmp * powf(rTotal, (float)(p - 1)));
+    if (ampByPair[p] <= ampByPair[p - 1]) ampByPair[p] = ampByPair[p - 1] + 1;
+  }
+  ampByPair[topPair] = DIV_COUNTER;
+
+  calReportLadderInterval = calibration_note_interval;
+  calReportAnchorPair     = -1; // 440 was a reference model, not a forced table slot
+
+  // =========================================================================
+  // 6. SWEEP RUNGS UPWARD (Pairs 2 -> 20) APPROXIMATING FREQUENCY
+  // =========================================================================
+  for (int p = 2; p <= topPair; ++p) {
+    if (calibrationCancelRequested) return false;
+    uint16_t fixedAmp = ampByPair[p];
+
+    // Approximate target frequency using the 4+ point least-squares polynomial model
+    float fGuess = freq_trace_guess(knownAmp, knownFreq, knownCount, (float)fixedAmp);
+    if (fGuess <= freqByPair[p - 1]) {
+      fGuess = freqByPair[p - 1] * rTotal;
+    }
+
+    // PIO sweeps frequency on the static amplitude
+    float found = find_freq_for_duty50(fixedAmp, fGuess, 1.30f, true);
+    if (found <= freqByPair[p - 1]) found = freqByPair[p - 1] * 1.05f;
+
+    freqByPair[p] = found;
+    add_known(found, (float)fixedAmp); // The model refines with each measured rung
+
+    uint8_t src = (p == topPair) ? CAL_SRC_ENDPOINT_FULL : CAL_SRC_RUNG;
+    cal_report_set_pair_from_gap(p, g_lastFreqBisectGapUs, found, src);
+  }
+
+  if (calibrationCancelRequested) return false;
+
+  // Sentinel out-of-bounds guard
+  for (int q = topPair + 1; q < numPairs; ++q) {
+    freqByPair[q] = 200000.0f; ampByPair[q] = DIV_COUNTER;
+    cal_report_set_pair(q, kCalDutyErrUnknown, CAL_SRC_SENTINEL);
+  }
+
+  // =========================================================================
+  // 7. PAIR 0 (AMP 0) 5-POINT POWER-LAW REGRESSION & MEASUREMENT
+  // =========================================================================
+  FreqSearchBounds f0Bounds = amp0_search_band(freqByPair[1]);
+
+  float sumLogA = 0.0f, sumLogF = 0.0f, sumLogA2 = 0.0f, sumLogAF = 0.0f;
+  constexpr int kFitPts = 5;
+  for (int i = 1; i <= kFitPts; ++i) {
+    float la = logf((float)ampByPair[i]);
+    float lf = logf(freqByPair[i]);
+    sumLogA  += la;
+    sumLogF  += lf;
+    sumLogA2 += la * la;
+    sumLogAF += la * lf;
+  }
+  float det = (float)kFitPts * sumLogA2 - sumLogA * sumLogA;
+  float alpha = (det > 1e-5f) ? (((float)kFitPts * sumLogAF - sumLogA * sumLogF) / det) : 1.0f;
+  float beta  = (sumLogF - alpha * sumLogA) / (float)kFitPts;
+
+  float f0Model = expf(beta);
+  if (f0Model <= 0.0f || f0Model >= freqByPair[1]) {
+    f0Model = freqByPair[1] * powf(1.0f / (float)ampByPair[1], alpha);
+  }
+  float f0Est = constrain(f0Model, f0Bounds.loHz, f0Bounds.hiHz);
+
+  if (autotuneAmp0Mode != AMP0_MODE_CALC) {
+    float found = measure_lowest_freq_at_amp0(f0Est, &f0Bounds);
+    float foundErr = duty_err_pct_from_gap(g_lastFreqBisectGapUs, found);
+    if (found >= f0Bounds.loHz && found < freqByPair[1] && fabsf(foundErr) <= kEndpointAcceptDutyPct) {
+      cal_report_set_pair_from_gap(0, g_lastFreqBisectGapUs, found, CAL_SRC_ENDPOINT_AMP0);
+      f0Est = found;
+    } else {
+      cal_report_set_pair(0, kCalDutyErrUnknown, CAL_SRC_FILLED);
+    }
+  } else {
+    cal_report_set_pair(0, kCalDutyErrUnknown, CAL_SRC_FILLED);
+  }
+
+  freqByPair[0] = f0Est;
+  ampByPair[0]  = 0;
+
+  // =========================================================================
+  // 8. COMMIT TO BUFFER & SANITY CHECK
+  // =========================================================================
+  ctx.calibrationData[0] = (uint32_t)(freqByPair[0] * 100.0f);
+  ctx.calibrationData[1] = 0;
+  for (int p = 1; p < numPairs; ++p) {
+    ctx.calibrationData[2 * p]     = (uint32_t)(freqByPair[p] * 100.0f);
+    ctx.calibrationData[2 * p + 1] = ampByPair[p];
+  }
+
+  return cal_table_is_monotonic(ctx.calibrationData, numPairs, ctx.dcoIndex, "FREQ_TRACE_ERROR");
+}
 // =============================================================================
 // Calibration Routine C: Fine Table Refinement
 // =============================================================================

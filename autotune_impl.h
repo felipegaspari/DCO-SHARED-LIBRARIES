@@ -13,10 +13,16 @@
 // Global Variable Definitions
 // =============================================================================
 
-bool calibrationFlag = false;
-bool manualCalibrationFlag = false;
-bool firstTuneFlag = false;
+// Cross-core / ISR handshake flags (ONLY THESE ARE VOLATILE)
+volatile bool calibrationFlag = false;
+volatile bool manualCalibrationFlag = false;
+volatile bool firstTuneFlag = false;
 volatile bool calibrationCancelRequested = false;
+volatile bool calibrationVerifyRequested = false;
+volatile bool pwCvProbeRequested = false;
+volatile bool calSyncNeutralRequested = false;
+volatile uint16_t ampCompCalibrationVal = 0;
+// =============================================================================
 
 uint8_t pwSweepMode = (uint8_t)PW_SWEEP_MODE_DEFAULT;
 uint8_t calibrationScope = CAL_SCOPE_FULL;
@@ -39,21 +45,18 @@ int calReportAnchorPair = -1;
 uint32_t calRunProbes = 0;
 unsigned long calRunStartMs = 0;
 
-volatile bool calibrationVerifyRequested = false;
-volatile bool pwCvProbeRequested = false;
 uint8_t manualCalSavedSyncMode = 0;
+uint8_t manualCalSavedOscPhaseSync = 0;
 uint8_t manualCalSavedSoftSyncChunks = 0;
-volatile bool calSyncNeutralRequested = false;
 
 uint8_t currentDCO = 0;
 unsigned long DCOCalibrationStart = 0;
-volatile uint16_t ampCompCalibrationVal = 0;
 float calibrationFreqHz = 0.0f;
 float gapGateFreqHz = 0.0f;
 float g_lastDrivenFreqHz = 0.0f;
 
 uint16_t initManualAmpCompCalibrationVal[NUM_OSCILLATORS];
-volatile uint16_t ampCompLowestFreqVal = (uint16_t)(10u * DIV_COUNTER / 14000u);
+uint16_t ampCompLowestFreqVal = (uint16_t)(10u * DIV_COUNTER / 14000u);
 uint8_t DCO_calibration_current_note = DCO_calibration_start_note;
 byte autotuneDebug = AUTOTUNE_DEBUG_LEVEL;
 
@@ -177,33 +180,35 @@ static void restore_voice_engine_after_calibration() {
   }
 }
 
-// Helper: Cleanly mute oscillators and keep state machines running so the
-// internal DCO core capacitors and RANGE RC filters can naturally drain to 0V.
 static void disable_all_oscillators_and_range_pwm() {
-  // 1. Keep state machines running in sync
-  start_voice_sms();
-
-  // 2. Mute all RANGE amplitudes cleanly.
-  // The PIO keeps cycling, which naturally drains the analog RC filters to 0V
-  // WITHOUT altering the synth's internal polyphonic voice routing.
+  // 1. Force all frequencies to 0, drive RESET pins LOW, and mute Range PWM
   for (int i = 0; i < NUM_OSCILLATORS; i++) {
-#ifndef RANGE0_PIO_DITHER_TEST
-    gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
-#endif
-    write_range_pwm(i, 0); // Mute voltage
-  }
+    PIO pioN = pio[VOICE_TO_PIO[i]];
+    uint8_t sm = VOICE_TO_SM[i];
 
-  // 3. Mute all PW channels (0% duty / 0V)
-  for (int ch = 0; ch < NUM_PW_CHANNELS; ch++) {
-    if (PW_PINS[ch] == PW_PIN_UNASSIGNED)
-      continue;
-    pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]), 0);
-    PW[ch] = 0;
+    // Clear OSR divider to 0 and force the physical RESET pin HGIH (shorts the capacitor)
+    pio_sm_set_enabled(pioN, sm, false);
+    pio_sm_put(pioN, sm, 0);
+    pio_sm_exec(pioN, sm, pio_encode_pull(false, false));
+    pio_sm_exec(pioN, sm, pio_encode_set(pio_pins, 0));
+    gpio_put(RESET_PINS[i], 1);
+
+  }
+  
+  for (int i = 0; i < NUM_PW_CHANNELS; i++) {
+    #ifndef RANGE0_PIO_DITHER_TEST
+    gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
+    #endif
+    write_range_pwm(i, DIV_COUNTER_PW); // max voltage to drive integrator output low
   }
 
   g_lastDrivenFreqHz = 0.0f;
 }
 
+/**
+ * @brief Prepares a single oscillator for calibration by muting all others,
+ *        draining its capacitor, and kickstarting the target frequency.
+ */
 void restart_DCO_calibration() {
   autotune_fill_init_manual_amp();
 
@@ -213,22 +218,17 @@ void restart_DCO_calibration() {
   calibrationData[0] = 0;
   calibrationData[1] = ampCompLowestFreqVal;
   calibrationData[2] = (uint32_t)(note_to_freq(DCO_calibration_current_note -
-                                               calibration_note_interval) *
-                                  100);
+                                               calibration_note_interval) * 100);
   calibrationData[3] = initManualAmpCompCalibrationVal[currentDCO] +
                        manualCalibrationOffset[currentDCO];
 
   DCOCalibrationStart = millis();
 
-  // 1. Ensure inactive oscillators stay muted
-  for (int i = 0; i < NUM_OSCILLATORS; i++) {
-    if (i != currentDCO) {
-      write_range_pwm(i, 0);
-    }
-  }
-
-  Serial.println("Delaying 1 second");
-  delay(1000);
+  disable_all_oscillators_and_range_pwm();
+  
+  Serial.println("Delaying 100ms");
+  // Allow the integrators to drain naturally while PIOs are still cycling
+  delay(100);
 
   // 2. CONFIGURE PW FOR ACTIVE OSCILLATOR ONLY
   const uint8_t pwCh = cal_pw_channel(currentDCO);
@@ -236,15 +236,6 @@ void restart_DCO_calibration() {
 
   if (hasPW) {
     apply_pw_baseline_solo(pwCh);
-  } else {
-    // Mute all PW channels for fixed-wave oscillators
-    for (int ch = 0; ch < NUM_PW_CHANNELS; ch++) {
-      if (PW_PINS[ch] != PW_PIN_UNASSIGNED) {
-        pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]),
-                           0);
-        PW[ch] = 0;
-      }
-    }
   }
 
   // 3. APPLY STARTING AMPLITUDE & PITCH TO ACTIVE OSCILLATOR
@@ -275,8 +266,7 @@ void restart_DCO_calibration() {
 
   g_lastDrivenFreqHz = 0.0f;
 
-  // Give the active DCO's analog circuit a moment to rise to its starting
-  // baseline
+  // Give the active DCO's analog circuit a moment to rise to its starting baseline
   delay(150);
 }
 
@@ -306,19 +296,14 @@ void apply_pw_baseline(uint8_t ch) {
   PW[ch] = level;
 }
 
-// Solos the active oscillator's PW baseline while strictly muting all other
-// channels to 0
+// Solos the active oscillator's PW baseline
 void apply_pw_baseline_solo(uint8_t soloCh) {
   for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
     if (PW_PINS[ch] == PW_PIN_UNASSIGNED)
       continue;
     if (ch == soloCh) {
       apply_pw_baseline(ch);
-    } else {
-      pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]),
-                         0);
-      PW[ch] = 0;
-    }
+    } 
   }
 }
 
@@ -563,24 +548,56 @@ static GapMeasurement set_pw_and_measure(uint8_t pwCh, uint16_t pw) {
 // Adaptive Multi-Precision PW Search Engine
 // =============================================================================
 
-static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
+/**
+ * @brief Measures the pulse-width duty cycle at a given frequency and PWM count.
+ * @details Programs the hardware PWM slice, allows the analog RC filter to settle,
+ *          and measures the pulse gap. If a narrow-pulse timeout occurs at the 
+ *          comparator threshold boundary, it executes an automatic multi-retry 
+ *          with additional analog settling delay before declaring a dead-zone.
+ * 
+ * @param pwCh   Target PW hardware channel index.
+ * @param pw     PWM compare level count (0..DIV_COUNTER_PW).
+ * @param freqHz Fundamental oscillator frequency in Hertz.
+ * @return Measured duty fraction (0.0 .. 1.0), or -1.0 if pulse collapsed (dead-zone).
+ */
+ static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
+  // 1. Guard against invalid channels or unassigned pins
   if (pwCh >= NUM_PW_CHANNELS || PW_PINS[pwCh] == PW_PIN_UNASSIGNED)
     return -1.0;
 
-  pwm_set_chan_level(PW_PWM_SLICES[pwCh], pwm_gpio_to_channel(PW_PINS[pwCh]),
-                     pw);
+  // 2. Program the analog PW CV PWM hardware
+  pwm_set_chan_level(PW_PWM_SLICES[pwCh], pwm_gpio_to_channel(PW_PINS[pwCh]), pw);
   PW[pwCh] = pw;
 
+  // 3. Baseline settling time: scaled to waveform periods & precision profile
   const CalPrecisionProfile &prec = cal_precision();
   wait_periods((float)freqHz, prec.settlePeriods, prec.settleMinMs * 1000u);
 
   ++calRunProbes;
 
-  // --- FIX: Pass real operating frequency to find_gap() ---
+  // 4. Primary edge-timing measurement
   gapGateFreqHz = (float)freqHz;
   GapMeasurement gm = measure_gap(2);
+
+  // 5. Borderline Dead-Zone Recovery:
+  // At narrow pulse widths (< 5%), the analog PWM low-pass RC filter may still be
+  // slewing, or the comparator output may miss the first edge. If the primary probe
+  // times out, provide extra settling time and retry twice before confirming a dead zone.
+  if (gm.timedOut) {
+    // Retry 1: 15ms extra RC filter settling
+    delay(15);
+    gm = measure_gap(2);
+
+    if (gm.timedOut) {
+      // Retry 2: 20ms extra settling (total ~35ms extra RC stabilization)
+      delay(20);
+      gm = measure_gap(2);
+    }
+  }
+
   gapGateFreqHz = 0.0f;
 
+  // 6. Confirmed pulse collapse (Hardware dead-zone reached)
   if (gm.timedOut || freqHz <= 0.0) {
     if (autotuneDebug >= 2) {
       Serial.println((String) "  [PW_PROBE] Ch=" + pwCh + " PW=" + pw +
@@ -589,18 +606,21 @@ static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
     return -1.0;
   }
 
+  // 7. Calculate duty cycle fraction from high/low gap difference
   double periodUs = 1000000.0 / freqHz;
   double duty = 0.5 + ((double)gm.value / (2.0 * periodUs));
-  if (duty < 0.0)
-    duty = 0.0;
-  if (duty > 1.0)
-    duty = 1.0;
+  
+  // Clamp to valid 0.0 .. 1.0 bounds
+  if (duty < 0.0) duty = 0.0;
+  if (duty > 1.0) duty = 1.0;
 
+  // 8. Debug telemetry
   if (autotuneDebug >= 2) {
     Serial.println((String) "  [PW_PROBE] Ch=" + pwCh + " PW=" + pw +
                    " -> GapUs=" + gm.value +
                    " Duty=" + String(duty * 100.0, 2) + "%");
   }
+  
   return duty;
 }
 
