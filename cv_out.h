@@ -8,10 +8,6 @@
  
  #include <stdint.h>
  
- #ifndef NUM_FILTERS
- #define NUM_FILTERS 2
- #endif
- 
  void init_cv_out();
  void update_CV_outs();
  void update_CV_outs_manual_calibration();

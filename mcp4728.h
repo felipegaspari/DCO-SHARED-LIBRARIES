@@ -37,16 +37,11 @@
  #ifdef ENABLE_MCP4728
  
  #include <stdint.h>
- #include "MCP4728_multiaddress.h"
  
  static constexpr uint8_t MCP_CHIP_COUNT = 3;
  static constexpr uint8_t MCP_ADDR7[3] = { 0x63, 0x64, 0x65 };
  static constexpr uint8_t MCP_FAST_WRITE_BYTES = 8;
  static constexpr uint32_t MCP_IDLE_WAIT_US = 2000;
- 
- extern MCP4728 mcp;
- extern MCP4728 mcp2;
- extern MCP4728 mcp3;
  
  extern bool mcp_present[3];
  extern uint8_t mcp_tx_buf[32];
@@ -56,6 +51,7 @@
  void mcp_dac_reattach();
  void mcp_i2c_wait_idle();
  bool mcp_i2c_quiesce();
+ bool mcp_write(uint8_t addr7, uint16_t a, uint16_t b, uint16_t c, uint16_t d);
  bool mcp_async_write(uint8_t addr7, uint16_t a, uint16_t b, uint16_t c, uint16_t d);
  
  // Platform hooks implemented by board shim

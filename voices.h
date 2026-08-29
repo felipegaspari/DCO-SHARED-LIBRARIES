@@ -91,6 +91,7 @@
  
 void voice_task_fixed_point();
 void voice_task_float();
+void voice_task_Q24();
 void voice_task_main();
 void voice_mark_on(uint8_t voice, uint8_t note1_idx, uint8_t note2_idx, uint8_t velocity_in);
 void voice_mark_off(uint8_t voice);

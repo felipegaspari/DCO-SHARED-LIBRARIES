@@ -5,11 +5,7 @@
 
  #ifndef DCO_PWM_H
  #define DCO_PWM_H
- 
- #ifndef NUM_FILTERS
- #define NUM_FILTERS 2
- #endif
- 
+  
  #include "hardware/pwm.h"
  
  #ifdef RANGE0_PIO_DITHER_TEST
@@ -42,7 +38,7 @@
   * @param osc Oscillator index (0..NUM_OSCILLATORS-1).
   * @param level Counter compare level.
   */
- static inline void SRAM_HOT(write_range_pwm)(uint8_t osc, uint16_t level) {
+ static void SRAM_HOT(write_range_pwm)(uint8_t osc, uint16_t level) {
  #ifdef RANGE0_PIO_DITHER_TEST
    range_pio_set_level(osc, level);
    return;

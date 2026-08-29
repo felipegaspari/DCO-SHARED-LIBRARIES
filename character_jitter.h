@@ -35,17 +35,24 @@
  /**
   * @brief Computes per-frame Q24 pitch modulation delta from pink noise (noise1).
   */
- static inline int32_t character_pitch_delta_q24(void) {
+ static int32_t SRAM_HOT(character_pitch_delta_q24)(void) {
    const int32_t s = char_pitch_scale_q15;
    const int32_t local_noise = (int32_t)noiseLevel[1];
    if (!s) return 0;
    return (int32_t)(((int64_t)(int32_t)local_noise * s) >> 15);
  }
+
+ static float SRAM_HOT(character_pitch_delta_float)(void) {
+   const float s = char_pitch_scale_q15;
+   const float local_noise = (float)noiseLevel[1];
+   if (!s) return 0;
+   return local_noise * s;
+ }
  
  /**
   * @brief Computes amplitude compensation PWM count delta from white noise (noise0).
   */
- static inline int32_t character_amp_delta(void) {
+ static int32_t SRAM_HOT(character_amp_delta)(void) {
   const int32_t local_noise = (int32_t)noiseLevel[0];
    return ((int32_t)local_noise * char_amp_scale_q15) >> 15;
  }
@@ -53,7 +60,7 @@
  /**
   * @brief Clamps amplitude PWM count to valid hardware slice counter range.
   */
- static inline uint16_t character_clamp_amp(int32_t level) {
+ static uint16_t SRAM_HOT(character_clamp_amp)(int32_t level) {
    if (level < 0) return 0;
    if (level > (int32_t)DIV_COUNTER) return (uint16_t)DIV_COUNTER;
    return (uint16_t)level;
@@ -62,7 +69,7 @@
  /**
   * @brief Computes pulse-width PWM count delta from white noise (noise0).
   */
- static inline int32_t character_pw_delta(void) {
+ static int32_t SRAM_HOT(character_pw_delta)(void) {
    const int32_t s = char_pw_scale_q15;
    const int32_t local_noise = (int32_t)noiseLevel[0];
    if (!s) return 0;

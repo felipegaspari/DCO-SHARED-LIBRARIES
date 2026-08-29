@@ -47,13 +47,19 @@
 //   4 QUIETEST_KEEP_HIGH as 2, spares highest held  mono high-note
 //   5 NO_STEAL           poly drops the note-on     mono first-note, later keys never sound
 enum VoiceAllocMode : uint8_t {
-  VOICE_ALLOC_ROUND_ROBIN = 0,
-  VOICE_ALLOC_OLDEST = 1,
-  VOICE_ALLOC_QUIETEST = 2,
-  VOICE_ALLOC_QUIETEST_KEEP_LOW = 3,
-  VOICE_ALLOC_QUIETEST_KEEP_HIGH = 4,
-  VOICE_ALLOC_NO_STEAL = 5,
-  VOICE_ALLOC_MODE_COUNT = 6
+  VOICE_ALLOC_ROUND_ROBIN = 0,       // Actually LRU (Least Recently Used)
+  VOICE_ALLOC_OLDEST = 1,            // Prophet-5 style (Oldest age)
+  VOICE_ALLOC_QUIETEST = 2,          // Modern Digital style (Lowest amplitude)
+  VOICE_ALLOC_QUIETEST_KEEP_LOW = 3, // Protects bassline
+  VOICE_ALLOC_QUIETEST_KEEP_HIGH = 4,// Protects melody
+  VOICE_ALLOC_NO_STEAL = 5,          // Drops note (Polymoog style)
+  
+  // --- CLASSIC MODES ---
+  VOICE_ALLOC_FIRST_FREE = 6,        // Juno/Jupiter style (Reset Allocation)
+  VOICE_ALLOC_LOWEST_PITCH = 7,      // Strict Steal: Kills the lowest bass note
+  VOICE_ALLOC_HIGHEST_PITCH = 8,     // Strict Steal: Kills the highest treble note
+  
+  VOICE_ALLOC_MODE_COUNT = 9
 };
 
 // alloc() returns this when VOICE_ALLOC_NO_STEAL refuses the note; also the
@@ -300,12 +306,36 @@ int16_t VOICE_ALLOC_HOT(ampQ15)(uint8_t i, uint32_t now_ms) const {
         case VOICE_ALLOC_QUIETEST:
         case VOICE_ALLOC_QUIETEST_KEEP_LOW:
         case VOICE_ALLOC_QUIETEST_KEEP_HIGH: {
-          // Upper 24 bits: Quietest first (lowest amplitude = largest key)
-          // Lower 8 bits:  LRU rank perfectly breaks ties when amplitudes match
           const uint32_t quietness = (uint32_t)(VOICE_ALLOC_Q15_ONE - ampQ15(i, now_ms));
           key = (quietness << 8) | (uint32_t)lruRank(i);
           break;
         }
+        
+        // ==========================================
+        // NEW MODE: Reset / First Free (Roland Style)
+        // ==========================================
+        case VOICE_ALLOC_FIRST_FREE:
+          // The lower the physical voice index (i), the higher the key.
+          // This forces the synth to constantly pack notes into voices 0, 1, 2...
+          key = (uint32_t)(MaxVoices - i);
+          break;
+
+        // ==========================================
+        // NEW MODE: Lowest Pitch Steal
+        // ==========================================
+        case VOICE_ALLOC_LOWEST_PITCH:
+          // Inverts the MIDI note. A lower MIDI note creates a LARGER key,
+          // making it the most attractive victim to be stolen.
+          key = (uint32_t)(255 - _note[i]);
+          break;
+
+        // ==========================================
+        // NEW MODE: Highest Pitch Steal
+        // ==========================================
+        case VOICE_ALLOC_HIGHEST_PITCH:
+          // Directly uses the MIDI note. A higher MIDI note is a LARGER key.
+          key = (uint32_t)(_note[i]);
+          break;
 
         case VOICE_ALLOC_ROUND_ROBIN:
         case VOICE_ALLOC_NO_STEAL:

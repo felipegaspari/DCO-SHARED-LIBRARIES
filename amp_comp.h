@@ -313,7 +313,7 @@ uint16_t SRAM_HOT(get_chan_level_lookup_fast)(int32_t x, uint8_t voiceN);
 uint16_t SRAM_HOT(get_chan_level_float_quad)(float freqHz, uint8_t voiceN);
 uint16_t SRAM_HOT(get_chan_level_lut)(float freqHz, uint8_t voiceN);
 
-static inline uint16_t SRAM_HOT(get_chan_level_by_method)(float freqHz, uint8_t voiceN) {
+static uint16_t SRAM_HOT(get_chan_level_by_method)(float freqHz, uint8_t voiceN) {
   switch (amp_comp_method) {
     case AMP_COMP_LUT:
       return get_chan_level_lut(freqHz, voiceN);
@@ -331,12 +331,12 @@ static inline uint16_t SRAM_HOT(get_chan_level_by_method)(float freqHz, uint8_t 
   }
 }
 
-static inline uint16_t SRAM_HOT(get_chan_level_float)(float freqHz, uint8_t voiceN) {
+static uint16_t SRAM_HOT(get_chan_level_float)(float freqHz, uint8_t voiceN) {
   return get_chan_level_by_method(freqHz, voiceN);
 }
 #endif
 
-static inline uint16_t SRAM_HOT(get_chan_level_for_engine)(float freqHz, uint8_t voiceN) {
+static uint16_t SRAM_HOT(get_chan_level_for_engine)(float freqHz, uint8_t voiceN) {
 #ifdef USE_FLOAT_AMP_COMP
   return get_chan_level_by_method(freqHz, voiceN);
 #else

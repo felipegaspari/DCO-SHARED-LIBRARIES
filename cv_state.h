@@ -11,8 +11,9 @@
  
 
  // 1. Envelope Timings & Restarts
- extern uint16_t ADSR1_attack, ADSR1_decay, ADSR1_sustain, ADSR1_release;
- extern uint16_t ADSR2_attack, ADSR2_decay, ADSR2_sustain, ADSR2_release;
+ extern volatile uint16_t ADSR1_attack, ADSR1_decay, ADSR1_sustain, ADSR1_release;
+ extern volatile uint16_t ADSR2_attack, ADSR2_decay, ADSR2_sustain, ADSR2_release;
+ extern volatile uint16_t ADSR3_attack, ADSR3_decay, ADSR3_sustain, ADSR3_release;
  extern bool ADSR1_restart, ADSR2_restart, ADSR3_restart;
  
  // 2. Envelope Curves
@@ -21,15 +22,15 @@
  extern uint8_t ADSR3AttackCurveVal, ADSR3DecayCurveVal, ADSR3ReleaseCurveVal;
  
  // 3. Filter, VCA & Dynamics Baseline Values
- extern uint16_t CUTOFF, RESONANCE, LFO2toVCF, VCALevel, LFO1toVCA;
- extern int16_t ADSR2toVCF, ADSR1toVCA;
+ extern volatile uint16_t CUTOFF, RESONANCE, LFO2toVCF, VCALevel, LFO1toVCA;
+ extern volatile int16_t ADSR2toVCF, ADSR1toVCA;
  extern uint16_t DIST_DRIVE, DIST_MIX;
  extern uint8_t FILTER_MODE;
  
  // 4. Precomputed Scales & Mod Buffers
- extern int32_t ADSR2toVCF_scale_q15, LFO2toVCF_scale_q15, LFO1toVCA_scale_q15;
- extern int32_t VCFKeytrackModifier_q15, VCFKeytrackPerVoice_q15[NUM_VOICES_TOTAL];
- extern int32_t velocityToVCF_q15, velocityToVCA_q15, vcf_drift_scale_q15;
+ extern volatile int32_t ADSR2toVCF_scale_q15, LFO2toVCF_scale_q15, LFO1toVCA_scale_q15;
+ extern volatile int32_t VCFKeytrackModifier_q15, VCFKeytrackPerVoice_q15[NUM_VOICES_TOTAL];
+ extern volatile int32_t velocityToVCF_q15, velocityToVCA_q15, vcf_drift_scale_q15;
  extern volatile int16_t VCF_DRIFT[NUM_VOICES_TOTAL];
  
  // Matrix Output Buffers
@@ -38,7 +39,8 @@
  extern volatile int32_t matrix_detune_mod[NUM_VOICES_TOTAL];
  
  extern bool RESONANCEAmpCompensation;
- extern int16_t VCAResonanceCompensation, VCFKeytrack;
+ extern volatile int16_t VCAResonanceCompensation; 
+ extern volatile int16_t VCFKeytrack;
  extern int8_t velocityToVCFVal, velocityToVCAVal;
  
  // 5. Hardware Output PWM Buffers
@@ -47,8 +49,8 @@
  
  // 6. Mixer Levels
  extern uint16_t lin_to_log_128[129];
- extern int16_t OSC1LevelVal, OSC2LevelVal, OSC3LevelVal, SubLevelVal;
- extern uint16_t OSC1Level, OSC2Level, OSC3Level, SubLevel;
+ extern volatile int16_t OSC1LevelVal, OSC2LevelVal, OSC3LevelVal, SubLevelVal;
+ extern volatile uint16_t OSC1Level, OSC2Level, OSC3Level, SubLevel;
  extern bool ADSR3Enabled;
  
  #endif // __CV_STATE_H__

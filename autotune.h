@@ -419,7 +419,7 @@ double expInterpolationSolveY(double x, double x0, double x1, double y0,
 
 // --- 1. FLOAT ENGINE (RP2350 with Hardware FPU) ---
 inline uint16_t
-get_PW_level_interpolated(uint16_t PWval, uint8_t oscN, float noteFreqHz = 0.0f,
+SRAM_HOT(get_PW_level_interpolated)(uint16_t PWval, uint8_t oscN, float noteFreqHz = 0.0f,
                           bool invertPolarity = PW_POLARITY_INVERTED) {
   const uint8_t ch = cal_pw_channel(oscN);
   if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED)
@@ -493,7 +493,7 @@ get_PW_level_interpolated(uint16_t PWval, uint8_t oscN, float noteFreqHz = 0.0f,
 #else
 
 // --- 2. FIXED-POINT ENGINE (RP2040: Zero-Float, Hardware SIO Math) ---
-inline uint16_t get_PW_level_interpolated(
+uint16_t SRAM_HOT(get_PW_level_interpolated)(
     uint16_t PWval, uint8_t oscN,
     int64_t noteFreqQ24 = 0, // Guarded against 32-bit overflow
     bool invertPolarity = PW_POLARITY_INVERTED) {
