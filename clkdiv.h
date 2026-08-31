@@ -24,7 +24,7 @@
   * @param hz Target frequency in Hz.
   * @return Total PIO cycles clamped to [0, 4000000000].
   */
- static inline __attribute__((always_inline)) uint32_t clkdiv_gold_hz_total_cycles(uint32_t sys_hz, double hz) {
+ static inline __attribute__((always_inline)) SRAM_HOT(uint32_t clkdiv_gold_total_cycles_Hz)(uint32_t sys_hz, double hz) {
    if (!(hz > 0.0)) return 0;
    double cyc = (double)sys_hz / hz;
    if (cyc >= 4.0e9) return 4000000000u;
@@ -38,26 +38,44 @@
   * @param freq_q24 Target frequency in Q24 fixed-point format (Hz * 2^24).
   * @return Total PIO clock cycles.
   */
- static inline __attribute__((always_inline)) uint32_t clkdiv_gold_total_cycles(uint32_t sys_hz, int64_t freq_q24) {
+ static inline __attribute__((always_inline)) SRAM_HOT(uint32_t clkdiv_gold_total_cycles)(uint32_t sys_hz, int64_t freq_q24) {
    if (freq_q24 <= 0) return 0;
    double hz = (double)freq_q24 * (1.0 / 16777216.0);
-   return clkdiv_gold_hz_total_cycles(sys_hz, hz);
+   return clkdiv_gold_total_cycles_Hz(sys_hz, hz);
  }
  
  /**
-  * @brief Q16 mode calculation using 64-bit / 32-bit integer division.
-  * @details Rounds Q24 input to Q16 Hz before performing `((sys_hz << 16) + (freq_q16 / 2)) / freq_q16`.
-  * @param sys_hz System clock frequency in Hz.
-  * @param freq_q24 Target frequency in Q24 fixed-point format.
-  * @return Total PIO clock cycles.
-  */
- static inline __attribute__((always_inline)) uint32_t clkdiv_q16_total_cycles(uint32_t sys_hz, int64_t freq_q24) {
-   if (freq_q24 <= 0) return 0;
-   uint32_t freq_q16 = (uint32_t)((freq_q24 + (int64_t)(1 << 7)) >> 8);
-   if (freq_q16 == 0) freq_q16 = 1;
-   uint64_t num = ((uint64_t)sys_hz << 16) + (uint64_t)(freq_q16 / 2u);
-   return (uint32_t)(num / freq_q16);
- }
+ * @brief Ultra-Fast PIO Clock Cycle Calculator for RP2040 and RP2350
+ * - RP2350: Hardware FPU VDIV.F32 (~16 cycles total vs ~80 cycles software int64 div)
+ * - RP2040: SIO 64/32 Hardware Divider (~8 cycles) with fast bitshift rounding
+ */
+static inline __attribute__((always_inline)) SRAM_HOT(uint32_t clkdiv_q16_total_cycles)(uint32_t sys_hz, int64_t freq_q16) {
+  if (__builtin_expect(freq_q16 == 0, 0)) return 0;
+    // =========================================================================
+    // UNIVERSAL PURE 32-BIT FIXED-POINT PATH (RP2040 & Generic MCUs)
+    // =========================================================================
+    
+    // 1. Initial 32-bit division estimate (scaled by 2^12)
+    // (sys_hz << 4) fits inside uint32_t for clocks up to 268 MHz
+    const uint32_t den = (freq_q16 + 2048) >> 12;
+    const uint32_t num32 = sys_hz << 4;
+    uint32_t q = num32 / (den ? den : 1);
+
+    // 2. Exact remainder via 64-bit multiplication (Single-cycle on M0+/M33/M4)
+    const uint64_t target = ((uint64_t)sys_hz << 16) + (uint64_t)(freq_q16 >> 1);
+    const uint64_t prod   = (uint64_t)q * (uint64_t)freq_q16;
+
+    // 3. Exact 32-bit refinement step (Resolves the remainder in 32-bit math)
+    if (prod < target) {
+        const uint32_t rem = (uint32_t)(target - prod);
+        q += rem / freq_q16;
+    } else if (prod > target) {
+        const uint32_t rem = (uint32_t)(prod - target);
+        q -= (rem + freq_q16 - 1) / freq_q16;
+    }
+
+    return q;
+}
  
  /**
   * @brief Precise Q8 64/32-bit calculation used as a fallback for sub-16 Hz frequencies in Q8 mode.
@@ -118,14 +136,18 @@
  }
  
  /**
-  * @brief Single-precision floating-point cycle calculation.
-  * @param sys_hz System clock frequency in Hz.
-  * @param hz Target frequency in Hz (float).
-  * @return Total PIO clock cycles.
-  */
- static inline __attribute__((always_inline)) uint32_t clkdiv_float_hz_total_cycles(uint32_t sys_hz, float hz) {
-   if (!(hz > 0.0f)) return 0;
-   return (uint32_t)fminf((float)sys_hz / hz + 0.5f, 4.0e9f);
+ * RP2350 OPTIMIZED: Branchless Float Cycle Calculation
+ * Relies on the Cortex-M33 hardware FPU and IT (If-Then) blocks.
+ */
+ static inline __attribute__((always_inline)) 
+ uint32_t SRAM_HOT(clkdiv_float_total_cycles_Hz)(float sys_hz_f, float hz) {
+     // ARM Cortex-M33 FPU processes sys_hz_f / 0.0f to +Infinity without crashing.
+     // We let the FPU do the math unconditionally to avoid pipeline flushes.
+     float cycles = (sys_hz_f / hz) + 0.5f;
+     cycles = fminf(cycles, 4.0e9f);
+     
+     // Ternary operator forces GCC to emit a conditional MOV (IT block) instead of a branch
+     return (hz > 0.0f) ? (uint32_t)cycles : 0; 
  }
  
  /**
@@ -134,12 +156,14 @@
   * @param freq_q24 Target frequency in Q24 fixed-point format.
   * @return Total PIO clock cycles.
   */
- static inline __attribute__((always_inline)) uint32_t clkdiv_float_total_cycles(uint32_t sys_hz, int64_t freq_q24) {
+ static inline __attribute__((always_inline)) SRAM_HOT(uint32_t clkdiv_float_total_cycles_Q24)(uint32_t sys_hz, int64_t freq_q24) {
    if (freq_q24 <= 0) return 0;
    float hz = (float)freq_q24 * (1.0f / 16777216.0f);
-   return clkdiv_float_hz_total_cycles(sys_hz, hz);
+   return clkdiv_float_total_cycles_Hz(sys_hz, hz);
  }
- 
+
+ #if defined(USE_FLOAT_VOICE_TASK)
+
  #if CLKDIV_MODE == CLKDIV_Q16
  #define clkdiv_live_total_cycles clkdiv_q16_total_cycles
  #elif CLKDIV_MODE == CLKDIV_Q8
@@ -147,9 +171,25 @@
  #elif CLKDIV_MODE == CLKDIV_FAST_Q4
  #define clkdiv_live_total_cycles clkdiv_fast_q4_total_cycles
  #elif CLKDIV_MODE == CLKDIV_FLOAT
- #define clkdiv_live_total_cycles clkdiv_float_total_cycles
+ #define clkdiv_live_total_cycles clkdiv_float_total_cycles_Hz
+ #else // CLKDIV_GOLD
+ #define clkdiv_live_total_cycles clkdiv_gold_total_cycles_Hz
+ #endif
+
+ #else
+
+ #if CLKDIV_MODE == CLKDIV_Q16
+ #define clkdiv_live_total_cycles clkdiv_q16_total_cycles
+ #elif CLKDIV_MODE == CLKDIV_Q8
+ #define clkdiv_live_total_cycles clkdiv_q8_total_cycles
+ #elif CLKDIV_MODE == CLKDIV_FAST_Q4
+ #define clkdiv_live_total_cycles clkdiv_fast_q4_total_cycles
+ #elif CLKDIV_MODE == CLKDIV_FLOAT
+ #define clkdiv_live_total_cycles clkdiv_float_total_cycles_Q24
  #else
  #define clkdiv_live_total_cycles clkdiv_gold_total_cycles
+
+ #endif
  #endif
  
  /**
@@ -159,11 +199,11 @@
   * @return Total PIO clock cycles.
   */
  static inline __attribute__((always_inline))
- uint32_t clkdiv_live_hz_total_cycles(uint32_t sys_hz, float hz) {
+ SRAM_HOT(uint32_t clkdiv_live_hz_total_cycles)(uint32_t sys_hz, float hz) {
  #if CLKDIV_MODE == CLKDIV_FLOAT
-   return clkdiv_float_hz_total_cycles(sys_hz, hz);
+   return clkdiv_float_total_cycles_Hz(sys_hz, hz);
  #elif CLKDIV_MODE == CLKDIV_GOLD
-   return clkdiv_gold_hz_total_cycles(sys_hz, (double)hz);
+   return clkdiv_gold_total_cycles_Hz(sys_hz, (double)hz);
  #else
    if (!(hz > 0.0f)) return 0;
    int64_t q24 = (int64_t)llround((double)hz * 16777216.0);

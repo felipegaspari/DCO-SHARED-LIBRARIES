@@ -179,7 +179,7 @@ inline uint16_t linearToExponential(uint16_t linearValue, float base, uint16_t m
 * @param v Input 32-bit value.
 * @return Scaled float modulation depth.
 */
-static inline __attribute__((always_inline)) float fast_lfo_depth_amt(uint32_t v) {
+static inline __attribute__((always_inline)) float SRAM_HOT(fast_lfo_depth_amt)(uint32_t v) {
   uint32_t sq = v * v;
   
   // Branchless override for values <= 1
@@ -187,5 +187,5 @@ static inline __attribute__((always_inline)) float fast_lfo_depth_amt(uint32_t v
   
   return (float)sq * 7.27272727e-9f;
 }
- 
+
  #endif // DCO_UTILS_H

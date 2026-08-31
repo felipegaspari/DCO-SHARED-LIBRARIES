@@ -46,11 +46,12 @@
   * @struct PWTrackCache
   * @brief Precomputed reciprocal spans for floating-point pulse-width pitch tracking.
   */
- struct PWTrackCache {
-   float f0, f1, f2;  ///< Anchor frequencies in Hz.
-   float invSpan01;   ///< Precomputed 1.0f / (f1 - f0).
-   float invSpan12;   ///< Precomputed 1.0f / (f2 - f1).
- };
+  struct PWTrackCache {
+    float f0, f1, f2;  ///< Anchor frequencies in Hz.
+    float invF0;       ///< Precomputed 1.0f / f0.
+    float invSpan01;   ///< Precomputed 1.0f / (f1 - f0).
+    float invSpan12;   ///< Precomputed 1.0f / (f2 - f1).
+  };
  #else
  /**
   * @struct PWTrackCache
@@ -58,6 +59,7 @@
   */
  struct PWTrackCache {
    uint32_t f0, f1, f2;      ///< Anchor frequencies in Q24 fixed-point format.
+   uint32_t invF0_q24;      ///< Precomputed (1 << 24) / f0.
    uint32_t invSpan01_q24;  ///< Precomputed (1 << 24) / (f1 - f0).
    uint32_t invSpan12_q24;  ///< Precomputed (1 << 24) / (f2 - f1).
  };

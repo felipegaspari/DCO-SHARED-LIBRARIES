@@ -51,39 +51,41 @@
      int16_t depth; 
  };
  
-// =============================================================================
-// 3. SHARED MATRIX STATE & BUFFERS
-// =============================================================================
-// =============================================================================
-// 3. SHARED MATRIX STATE & BUFFERS
-// =============================================================================
-extern SRAM_DATA ModSlot mod_slots[8];
-extern SRAM_DATA int32_t voice_mod_sums[MAX_SUPPORTED_VOICES][MOD_DEST_COUNT];
-extern SRAM_DATA int32_t prev_depth_mods[MAX_SUPPORTED_VOICES][8];
-
-extern SRAM_DATA int16_t aftertouch_q15;
-extern SRAM_DATA int16_t mod_wheel_q15;
-extern SRAM_DATA int16_t expression_q15;
-extern SRAM_DATA int16_t breath_q15;
-extern SRAM_DATA int16_t random_sh_q15[MAX_SUPPORTED_VOICES];
-
-// Hardware delta buffers (instantiated in cv_out.ino, referenced here)
-#if defined(USE_FLOAT_VOICE_TASK) || defined(STM32H7) || defined(STM32H7xx) || defined(STM32H750xx) || defined(ARDUINO_ARCH_STM32)
-extern volatile float matrix_pitch_mod_f[MAX_SUPPORTED_VOICES];
-extern volatile float matrix_osc1_pitch_mod_f[MAX_SUPPORTED_VOICES];
-extern volatile float matrix_osc2_pitch_mod_f[MAX_SUPPORTED_VOICES];
-#endif
-
-extern volatile int32_t matrix_pitch_mod_q24[MAX_SUPPORTED_VOICES];
-extern volatile int32_t matrix_osc1_pitch_mod_q24[MAX_SUPPORTED_VOICES];
-extern volatile int32_t matrix_osc2_pitch_mod_q24[MAX_SUPPORTED_VOICES];
-extern volatile int32_t matrix_pw_mod[MAX_SUPPORTED_VOICES];
-
-static inline int32_t mod_clamp_4095(int32_t v) {
-    if (v < -4095) return -4095;
-    if (v > 4095) return 4095;
-    return v;
-}
+ // =============================================================================
+ // 3. SHARED MATRIX STATE & BUFFERS
+ // =============================================================================
+ extern SRAM_DATA ModSlot mod_slots[8];
+ extern SRAM_DATA alignas(8) int32_t voice_mod_sums[MAX_SUPPORTED_VOICES][MOD_DEST_COUNT];
+ extern SRAM_DATA alignas(8) int32_t prev_depth_mods[MAX_SUPPORTED_VOICES][8];
+ 
+ extern SRAM_DATA int16_t aftertouch_q15;
+ extern SRAM_DATA int16_t mod_wheel_q15;
+ extern SRAM_DATA int16_t expression_q15;
+ extern SRAM_DATA int16_t breath_q15;
+ extern SRAM_DATA int16_t random_sh_q15[MAX_SUPPORTED_VOICES];
+ 
+ // Hardware delta buffers
+ #if defined(USE_FLOAT_VOICE_TASK) || defined(STM32H7) || defined(STM32H7xx) || defined(STM32H750xx) || defined(ARDUINO_ARCH_STM32)
+ extern volatile float matrix_pitch_mod_f[MAX_SUPPORTED_VOICES];
+ extern volatile float matrix_osc1_pitch_mod_f[MAX_SUPPORTED_VOICES];
+ extern volatile float matrix_osc2_pitch_mod_f[MAX_SUPPORTED_VOICES];
+ #endif
+ 
+ extern volatile int32_t matrix_pitch_mod_q24[MAX_SUPPORTED_VOICES];
+ extern volatile int32_t matrix_osc1_pitch_mod_q24[MAX_SUPPORTED_VOICES];
+ extern volatile int32_t matrix_osc2_pitch_mod_q24[MAX_SUPPORTED_VOICES];
+ extern volatile int32_t matrix_pw_mod[MAX_SUPPORTED_VOICES];
+ extern volatile int32_t matrix_xmod_mod[MAX_SUPPORTED_VOICES];
+ 
+ static inline int32_t mod_clamp_4095(int32_t v) {
+ #if defined(__ARM_FEATURE_SAT)
+     return __builtin_arm_ssat(v, 13);
+ #else
+     if (v < -4095) return -4095;
+     if (v > 4095) return 4095;
+     return v;
+ #endif
+ }
  
  // =============================================================================
  // 4. CORE ENGINE LIFECYCLE & SETTERS
@@ -160,7 +162,7 @@ static inline int32_t mod_clamp_4095(int32_t v) {
  #undef DECL_MOD_SLOT_APPLIER_SET
  
  // =============================================================================
- // 6. REALTIME ACCUMULATOR CORE (1-Cycle MAC Optimized)
+ // 6. REALTIME ACCUMULATOR CORE
  // =============================================================================
  static const int16_t VOICE_ID_SPREAD_MAP[4][4] = {
      {-32768, 0, 0, 0},
@@ -169,29 +171,22 @@ static inline int32_t mod_clamp_4095(int32_t v) {
      {-32768, -10923, 10922, 32767}
  };
  
- static inline int32_t fast_mod_clamp(int32_t v) {
+ __attribute__((always_inline)) static inline int32_t fast_mod_clamp(int32_t v) {
  #if defined(__ARM_FEATURE_SAT)
-     return __builtin_arm_ssat(v, 13); // Native 1-cycle saturation [-4096, 4095]
+     return __builtin_arm_ssat(v, 13); 
  #else
-     if (v < -4095) return -4095;
-     if (v > 4095) return 4095;
-     return v;
+     v = (v > 4095) ? 4095 : v;
+     return (v < -4096) ? -4096 : v;
  #endif
  }
  
- void SRAM_HOT(mod_matrix_accumulate_all)(const ModSources* __restrict sources, uint8_t num_voices) {
-     if (num_voices > MAX_SUPPORTED_VOICES) num_voices = MAX_SUPPORTED_VOICES;
-     if (num_voices == 0) return;
-     
-     // Constant compile-time size zeroing avoids libc calls and jitter
-     memset(voice_mod_sums, 0, sizeof(voice_mod_sums));
-     
-     uint8_t spread_idx = (num_voices > 0) ? (num_voices - 1) : 0;
-     if (spread_idx > 3) spread_idx = 3;
- 
-     int32_t (* __restrict sums)[MOD_DEST_COUNT] = voice_mod_sums;
-     const int32_t (* __restrict prevs)[8] = (const int32_t(*)[8])prev_depth_mods;
- 
+ template <uint8_t NV>
+ __attribute__((always_inline)) static inline void mm_slot_accum_core(
+     int32_t (* __restrict sums)[MOD_DEST_COUNT],
+     const int32_t (* __restrict prevs_in)[8],
+     const ModSources* __restrict sources,
+     uint8_t spread_idx) 
+ {
      for (uint8_t i = 0; i < 8; i++) {
          const uint8_t src_id = mod_slots[i].src;
          if (src_id == SRC_OFF) continue; 
@@ -202,9 +197,9 @@ static inline int32_t mod_clamp_4095(int32_t v) {
          const int32_t base_depth = mod_slots[i].depth;
  
          #define MACRO_ACCUM_VOICES(SRC_EXPR) \
-             _Pragma("GCC unroll 4") \
-             for (uint8_t v = 0; v < num_voices; v++) { \
-                 int32_t depth = fast_mod_clamp(base_depth + prevs[v][i]); \
+             _Pragma("GCC unroll 8") \
+             for (uint8_t v = 0; v < NV; v++) { \
+                 int32_t depth = fast_mod_clamp(base_depth + prevs_in[v][i]); \
                  sums[v][dest] += ((SRC_EXPR) * depth); \
              }
  
@@ -230,13 +225,83 @@ static inline int32_t mod_clamp_4095(int32_t v) {
          }
          #undef MACRO_ACCUM_VOICES
      }
+ }
  
-     // Depth Slot Feedback (Unrolled)
-     for (uint8_t v = 0; v < num_voices; v++) {
-         _Pragma("GCC unroll 8")
-         for (uint8_t i = 0; i < 8; i++) {
-             prev_depth_mods[v][i] = sums[v][DEST_MOD_SLOT0_DEPTH + i] >> 15;
+ void SRAM_HOT(mod_matrix_accumulate_all)(const ModSources* __restrict sources, uint8_t num_voices) {
+     if (num_voices == 0) return;
+     if (num_voices > MAX_SUPPORTED_VOICES) num_voices = MAX_SUPPORTED_VOICES;
+ 
+     uint8_t spread_idx;
+     {
+         BENCH_BEGIN(mm_setup);
+         
+         for (uint8_t v = 0; v < num_voices; v++) {
+             int64_t* __restrict row64 = (int64_t*)voice_mod_sums[v];
+             constexpr uint8_t double_words = MOD_DEST_COUNT / 2;
+             
+             _Pragma("GCC unroll 32") 
+             for (uint8_t d = 0; d < double_words; d++) {
+                 row64[d] = 0;
+             }
+             
+             if constexpr (MOD_DEST_COUNT % 2 != 0) {
+                 voice_mod_sums[v][MOD_DEST_COUNT - 1] = 0;
+             }
          }
+         
+         spread_idx = __builtin_arm_usat(num_voices - 1, 2);
+         BENCH_END(mm_setup);
+     }
+ 
+     int32_t (* __restrict sums)[MOD_DEST_COUNT] = voice_mod_sums;
+     const int32_t (* __restrict prevs_in)[8] = (const int32_t(*)[8])prev_depth_mods;
+ 
+     // =========================================================================
+     // 2. Polyphonic Multiply-Accumulate Loop Dispatcher
+     // =========================================================================
+     {
+         BENCH_BEGIN(mm_slot_accum);
+         
+         switch (num_voices) {
+             case 1: mm_slot_accum_core<1>(sums, prevs_in, sources, spread_idx); break;
+             case 2: mm_slot_accum_core<2>(sums, prevs_in, sources, spread_idx); break;
+             case 3: mm_slot_accum_core<3>(sums, prevs_in, sources, spread_idx); break;
+             case 4: mm_slot_accum_core<4>(sums, prevs_in, sources, spread_idx); break;
+ #if MAX_SUPPORTED_VOICES >= 5
+             case 5: mm_slot_accum_core<5>(sums, prevs_in, sources, spread_idx); break;
+ #endif
+ #if MAX_SUPPORTED_VOICES >= 6
+             case 6: mm_slot_accum_core<6>(sums, prevs_in, sources, spread_idx); break;
+ #endif
+ #if MAX_SUPPORTED_VOICES >= 7
+             case 7: mm_slot_accum_core<7>(sums, prevs_in, sources, spread_idx); break;
+ #endif
+ #if MAX_SUPPORTED_VOICES >= 8
+             case 8: mm_slot_accum_core<8>(sums, prevs_in, sources, spread_idx); break;
+ #endif
+             default: break; 
+         }
+         
+         BENCH_END(mm_slot_accum);
+     }
+ 
+     // =========================================================================
+     // 3. Depth Slot Feedback Extraction
+     // =========================================================================
+     {
+         BENCH_BEGIN(mm_depth_feedback);
+         int32_t (* __restrict prevs_out)[8] = (int32_t(*)[8])prev_depth_mods;
+ 
+         for (uint8_t v = 0; v < num_voices; v++) {
+             const int32_t* __restrict v_sums = &sums[v][DEST_MOD_SLOT0_DEPTH];
+             int32_t* __restrict v_prev = prevs_out[v];
+ 
+             _Pragma("GCC unroll 8")
+             for (uint8_t i = 0; i < 8; i++) {
+                 v_prev[i] = v_sums[i] >> 15;
+             }
+         }
+         BENCH_END(mm_depth_feedback);
      }
  }
  
@@ -244,72 +309,62 @@ static inline int32_t mod_clamp_4095(int32_t v) {
  // 7. HARDWARE DELTA ACCESSORS
  // =============================================================================
  
-// --- FLOAT ACCESSOR (2-Cycle FPU: VCVT + VMUL) ---
-template <uint8_t dest>
-static float SRAM_HOT(mod_matrix_get_dest_float)(uint8_t voice) {
-    if constexpr (dest >= MOD_DEST_COUNT) return 0.0f;
-    const int32_t raw_sum = voice_mod_sums[voice][dest];
-
-    if constexpr (dest == DEST_PITCH || dest == DEST_OSC1_PITCH || dest == DEST_OSC2_PITCH) {
-        // Matches >> 2 in Q24: 1.0f = 1 Octave
-        static constexpr float RAW_TO_OCTAVE = 1.0f / 67108864.0f; // 1 / 2^26
-        return (float)raw_sum * RAW_TO_OCTAVE;
-
-    } else if constexpr (dest == DEST_PW) {
-        // Matches >> 18: Integer 10-bit PWM range (0 .. 1023)
-        static constexpr float RAW_TO_PW = 1.0f / 262144.0f; // 1 / 2^18
-        return (float)raw_sum * RAW_TO_PW;
-
-    } else if constexpr (dest == DEST_VCA_LEVEL) {
-        // Matches >> 14
-        static constexpr float RAW_TO_VCA = 1.0f / 16384.0f; // 1 / 2^14
-        return (float)raw_sum * RAW_TO_VCA;
-
-    } else if constexpr (dest == DEST_ENV_TO_VCF     || dest == DEST_ENV_TO_VCA   || 
-                         dest == DEST_LFO1_DEPTH     || dest == DEST_LFO2_DEPTH   || 
-                         dest == DEST_ENV_VCF_ATTACK || dest == DEST_ENV_VCF_DECAY || 
-                         dest == DEST_ENV_VCA_ATTACK || dest == DEST_ENV_VCA_DECAY || 
-                         dest == DEST_ENV_ALL_TIME) {
-        // Matches >> 12: High-sensitivity Envelope rate/depth scaling
-        static constexpr float RAW_TO_ENV_TIME = 1.0f / 4096.0f; // 1 / 2^12
-        return (float)raw_sum * RAW_TO_ENV_TIME;
-
-    } else {
-        // Matches >> 15: Full 12-bit range (-4095.0f .. +4095.0f)
-        // Covers: DEST_VCF_CUTOFF, DEST_VCF_RESO, DEST_LFO1_SPEED, DEST_LFO2_SPEED, DEST_LFO_ALL_SPEED
-        static constexpr float RAW_TO_12BIT = 1.0f / 32768.0f; // 1 / 2^15
-        return (float)raw_sum * RAW_TO_12BIT;
-    }
-}
+ template <uint8_t dest>
+ static float SRAM_HOT(mod_matrix_get_dest_float)(uint8_t voice) {
+     if constexpr (dest >= MOD_DEST_COUNT) return 0.0f;
+     const int32_t raw_sum = voice_mod_sums[voice][dest];
  
- // --- INTEGER / FIXED-POINT ACCESSOR ---
+     if constexpr (dest == DEST_PITCH || dest == DEST_OSC1_PITCH || dest == DEST_OSC2_PITCH) {
+         static constexpr float RAW_TO_OCTAVE = 1.0f / 67108864.0f; 
+         return (float)raw_sum * RAW_TO_OCTAVE;
+ 
+     } else if constexpr (dest == DEST_PW) {
+         static constexpr float RAW_TO_PW = 1.0f / 262144.0f; 
+         return (float)raw_sum * RAW_TO_PW;
+ 
+     } else if constexpr (dest == DEST_VCA_LEVEL) {
+         static constexpr float RAW_TO_VCA = 1.0f / 16384.0f; 
+         return (float)raw_sum * RAW_TO_VCA;
+ 
+     } else if constexpr (dest == DEST_ENV_TO_VCF     || dest == DEST_ENV_TO_VCA   || 
+                          dest == DEST_LFO1_DEPTH     || dest == DEST_LFO2_DEPTH   || 
+                          dest == DEST_ENV_VCF_ATTACK || dest == DEST_ENV_VCF_DECAY || 
+                          dest == DEST_ENV_VCA_ATTACK || dest == DEST_ENV_VCA_DECAY || 
+                          dest == DEST_ENV_ALL_TIME   || dest == DEST_CROSSMOD_DEPTH) {
+         static constexpr float RAW_TO_ENV_TIME = 1.0f / 4096.0f; 
+         return (float)raw_sum * RAW_TO_ENV_TIME;
+ 
+     } else {
+         static constexpr float RAW_TO_12BIT = 1.0f / 32768.0f; 
+         return (float)raw_sum * RAW_TO_12BIT;
+     }
+ }
+ 
  template <uint8_t dest>
  int32_t SRAM_HOT(mod_matrix_get_dest_fast)(uint8_t voice) {
      if constexpr (dest >= MOD_DEST_COUNT) return 0;
      const int32_t raw_sum = voice_mod_sums[voice][dest];
  
      if constexpr (dest == DEST_PITCH || dest == DEST_OSC1_PITCH || dest == DEST_OSC2_PITCH) {
-         return raw_sum >> 2; // Q24
+         return raw_sum >> 2; 
      } else if constexpr (dest == DEST_PW) {
-         return raw_sum >> 18; // Integer PW delta
+         return raw_sum >> 18; 
      } else if constexpr (dest == DEST_VCF_RESO) {
          return raw_sum >> 16;
      } else if constexpr (dest == DEST_VCA_LEVEL) {
          return raw_sum >> 14;
-    } else if constexpr (dest == DEST_LFO1_SPEED || dest == DEST_LFO2_SPEED || 
-            dest == DEST_LFO3_SPEED) {
-        // Full 12-bit range (-4095 .. +4095) for fast exponential LFO FM sweeps
-        return raw_sum >> 15;
-    } else if constexpr (dest == DEST_ENV_TO_VCF || dest == DEST_ENV_TO_VCA || 
-            dest == DEST_LFO1_DEPTH || dest == DEST_LFO2_DEPTH || 
-            dest == DEST_ENV_VCF_ATTACK || dest == DEST_ENV_VCF_DECAY || 
-            dest == DEST_ENV_VCA_ATTACK || dest == DEST_ENV_VCA_DECAY || 
-            dest == DEST_ENV_ALL_TIME) {
-    return raw_sum >> 12;
-    } else {
-    return raw_sum >> 15;
-    }
-}
+     } else if constexpr (dest == DEST_LFO1_SPEED || dest == DEST_LFO2_SPEED || dest == DEST_LFO3_SPEED) {
+         return raw_sum >> 15;
+     } else if constexpr (dest == DEST_ENV_TO_VCF     || dest == DEST_ENV_TO_VCA   || 
+                          dest == DEST_LFO1_DEPTH     || dest == DEST_LFO2_DEPTH   || 
+                          dest == DEST_ENV_VCF_ATTACK || dest == DEST_ENV_VCF_DECAY || 
+                          dest == DEST_ENV_VCA_ATTACK || dest == DEST_ENV_VCA_DECAY || 
+                          dest == DEST_ENV_ALL_TIME   || dest == DEST_CROSSMOD_DEPTH) {
+         return raw_sum >> 12;
+     } else {
+         return raw_sum >> 15;
+     }
+ }
  
  int32_t SRAM_HOT(mod_matrix_get_dest)(uint8_t voice, uint8_t dest) {
      if (voice >= MAX_SUPPORTED_VOICES || dest >= MOD_DEST_COUNT) return 0;
@@ -330,13 +385,14 @@ static float SRAM_HOT(mod_matrix_get_dest_float)(uint8_t voice) {
          case DEST_ENV_VCF_DECAY:
          case DEST_ENV_VCA_ATTACK:
          case DEST_ENV_VCA_DECAY:
-         case DEST_ENV_ALL_TIME:   return raw_sum >> 12;
+         case DEST_ENV_ALL_TIME:   
+         case DEST_CROSSMOD_DEPTH: return raw_sum >> 12;
          default:                  return raw_sum >> 15;
      }
  }
  
  // =============================================================================
- // 8. VOICE ENGINE BRIDGE (Zero-overhead Publishing)
+ // 8. VOICE ENGINE BRIDGE
  // =============================================================================
  void SRAM_HOT(mod_matrix_publish_to_voices)(uint8_t num_voices) {
      if (num_voices > MAX_SUPPORTED_VOICES) num_voices = MAX_SUPPORTED_VOICES;
@@ -352,22 +408,32 @@ static float SRAM_HOT(mod_matrix_get_dest_float)(uint8_t voice) {
          matrix_osc1_pitch_mod_q24[v] = mod_matrix_get_dest_fast<DEST_OSC1_PITCH>(v);
          matrix_osc2_pitch_mod_q24[v] = mod_matrix_get_dest_fast<DEST_OSC2_PITCH>(v);
  #endif
-         matrix_pw_mod[v] = mod_matrix_get_dest_fast<DEST_PW>(v);
+         matrix_pw_mod[v]   = mod_matrix_get_dest_fast<DEST_PW>(v);
+         matrix_xmod_mod[v] = mod_matrix_get_dest_fast<DEST_CROSSMOD_DEPTH>(v);
      }
  }
  
+ // 1-Cycle Native Hardware Saturation
  uint16_t SRAM_HOT(apply_mod_dir_12b)(uint16_t base, int32_t mod_delta) {
+ #if defined(__ARM_FEATURE_SAT)
+     return (uint16_t)__builtin_arm_usat((int32_t)base + mod_delta, 12);
+ #else
      int32_t calc = (int32_t)base + mod_delta; 
      if (calc < 0) return 0;
      if (calc > 4095) return 4095;
      return (uint16_t)calc;
+ #endif
  }
  
  uint16_t SRAM_HOT(apply_mod_inv_12b)(uint16_t base, int32_t mod_delta) {
+ #if defined(__ARM_FEATURE_SAT)
+     return (uint16_t)__builtin_arm_usat((int32_t)base - mod_delta, 12);
+ #else
      int32_t calc = (int32_t)base - mod_delta;
      if (calc < 0) return 0;
      if (calc > 4095) return 4095;
      return (uint16_t)calc;
+ #endif
  }
  
  #endif // __SHARED_MOD_MATRIX_ENGINE_H__

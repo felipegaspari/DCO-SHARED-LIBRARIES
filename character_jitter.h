@@ -57,14 +57,16 @@
    return ((int32_t)local_noise * char_amp_scale_q15) >> 15;
  }
  
- /**
-  * @brief Clamps amplitude PWM count to valid hardware slice counter range.
-  */
- static uint16_t SRAM_HOT(character_clamp_amp)(int32_t level) {
-   if (level < 0) return 0;
-   if (level > (int32_t)DIV_COUNTER) return (uint16_t)DIV_COUNTER;
-   return (uint16_t)level;
+/**
+ * RP2350 OPTIMIZED: Branchless Clamp
+ * Executes unconditionally in 2 cycles using IT (If-Then) blocks.
+ */
+ static inline __attribute__((always_inline)) 
+ uint16_t SRAM_HOT(character_clamp_amp)(int32_t level) {
+   int32_t clamped = (level < 0) ? 0 : level;
+   return (uint16_t)((clamped > (int32_t)DIV_COUNTER) ? (int32_t)DIV_COUNTER : clamped);
  }
+ 
  
  /**
   * @brief Computes pulse-width PWM count delta from white noise (noise0).

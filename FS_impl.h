@@ -84,9 +84,10 @@ void precompute_pw_tracking_cache() {
     if (f1 <= f0)   f1 = 440.0f;
     if (f2 <= f1)   f2 = 2800.0f;
 
-    pwTrackCache[ch].f0 = f0;
-    pwTrackCache[ch].f1 = f1;
-    pwTrackCache[ch].f2 = f2;
+    pwTrackCache[ch].f0        = f0;
+    pwTrackCache[ch].f1        = f1;
+    pwTrackCache[ch].f2        = f2;
+    pwTrackCache[ch].invF0     = 1.0f / f0;              // <--- Precomputed reciprocal (avoids 14-cycle VDIV in hot path)
     pwTrackCache[ch].invSpan01 = 1.0f / (f1 - f0);
     pwTrackCache[ch].invSpan12 = 1.0f / (f2 - f1);
 
@@ -110,6 +111,7 @@ void precompute_pw_tracking_cache() {
     uint32_t span12 = f2 - f1;
 
     // Q31 Reciprocal Multipliers (Prevents underflow, enables single-cycle integer MAC)
+    pwTrackCache[ch].invF0_q24     = (f0 > 0) ? (uint32_t)((1ULL << 31) / f0) : 0;
     pwTrackCache[ch].invSpan01_q24 = (span01 > 0) ? (uint32_t)((1ULL << 31) / span01) : 0;
     pwTrackCache[ch].invSpan12_q24 = (span12 > 0) ? (uint32_t)((1ULL << 31) / span12) : 0;
 #endif

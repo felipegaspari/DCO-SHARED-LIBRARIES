@@ -58,7 +58,7 @@ void pio_probe_report_flush();
 static inline const char *bench_pitch_interp_mode_name() {
 #if PITCH_INTERP_MODE == PITCH_INTERP_FLOAT
   return "FLOAT";
-#elif PITCH_INTERP_MODE == PITCH_INTERP_FLOAT_FAST
+#elif PITCH_INTERP_MODE == PITCH_INTERP_FLOAT_CACHED
   return "FLOAT_FAST";
 #elif PITCH_INTERP_MODE == PITCH_INTERP_RATIO_Q16
   return "RATIO_Q16";
