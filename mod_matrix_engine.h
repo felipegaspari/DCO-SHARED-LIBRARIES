@@ -55,8 +55,8 @@
  // 3. SHARED MATRIX STATE & BUFFERS
  // =============================================================================
  extern SRAM_DATA ModSlot mod_slots[8];
- extern SRAM_DATA alignas(8) int32_t voice_mod_sums[MAX_SUPPORTED_VOICES][MOD_DEST_COUNT];
- extern SRAM_DATA alignas(8) int32_t prev_depth_mods[MAX_SUPPORTED_VOICES][8];
+ alignas(8) extern SRAM_DATA int32_t voice_mod_sums[MAX_SUPPORTED_VOICES][MOD_DEST_COUNT];
+ alignas(8) extern SRAM_DATA int32_t prev_depth_mods[MAX_SUPPORTED_VOICES][8];
  
  extern SRAM_DATA int16_t aftertouch_q15;
  extern SRAM_DATA int16_t mod_wheel_q15;
@@ -233,7 +233,7 @@
  
      uint8_t spread_idx;
      {
-         BENCH_BEGIN(mm_setup);
+         
          
          for (uint8_t v = 0; v < num_voices; v++) {
              int64_t* __restrict row64 = (int64_t*)voice_mod_sums[v];
@@ -250,7 +250,7 @@
          }
          
          spread_idx = __builtin_arm_usat(num_voices - 1, 2);
-         BENCH_END(mm_setup);
+         
      }
  
      int32_t (* __restrict sums)[MOD_DEST_COUNT] = voice_mod_sums;
@@ -260,7 +260,7 @@
      // 2. Polyphonic Multiply-Accumulate Loop Dispatcher
      // =========================================================================
      {
-         BENCH_BEGIN(mm_slot_accum);
+         
          
          switch (num_voices) {
              case 1: mm_slot_accum_core<1>(sums, prevs_in, sources, spread_idx); break;
@@ -282,14 +282,14 @@
              default: break; 
          }
          
-         BENCH_END(mm_slot_accum);
+         
      }
  
      // =========================================================================
      // 3. Depth Slot Feedback Extraction
      // =========================================================================
      {
-         BENCH_BEGIN(mm_depth_feedback);
+         
          int32_t (* __restrict prevs_out)[8] = (int32_t(*)[8])prev_depth_mods;
  
          for (uint8_t v = 0; v < num_voices; v++) {
@@ -301,7 +301,7 @@
                  v_prev[i] = v_sums[i] >> 15;
              }
          }
-         BENCH_END(mm_depth_feedback);
+         
      }
  }
  
