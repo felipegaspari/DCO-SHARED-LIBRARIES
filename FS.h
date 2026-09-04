@@ -37,10 +37,11 @@
    uint16_t lowLimit;  ///< Minimum narrow-pulse threshold before oscillator stall.
    uint16_t highLimit; ///< Maximum wide-pulse threshold before oscillator stall.
  };
- 
+
  // =============================================================================
  // 2. Dual-Engine Pitch Tracking RAM Cache Struct
  // =============================================================================
+ 
  #ifdef USE_FLOAT_VOICE_TASK
  /**
   * @struct PWTrackCache
@@ -59,7 +60,7 @@
   */
  struct PWTrackCache {
    uint32_t f0, f1, f2;      ///< Anchor frequencies in Q24 fixed-point format.
-   uint32_t invF0_q24;      ///< Precomputed (1 << 24) / f0.
+   uint32_t invF0;
    uint32_t invSpan01_q24;  ///< Precomputed (1 << 24) / (f1 - f0).
    uint32_t invSpan12_q24;  ///< Precomputed (1 << 24) / (f2 - f1).
  };

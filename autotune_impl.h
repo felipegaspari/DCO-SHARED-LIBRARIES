@@ -127,25 +127,18 @@ inline void apply_pw_center(uint8_t ch) {
   uint16_t center = PW_CENTER[ch];
 
   if (pwSweepMode == PW_SWEEP_FULL) {
-    // DCO4: Must be near mid-rail (~512)
     if (center < (DIV_COUNTER_PW / 10) || center > (DIV_COUNTER_PW * 9 / 10)) {
       center = DIV_COUNTER_PW / 2;
     }
   } else {
-    // DCO3: Valid center can live at 0..102 (or near top rail)
     if (center > DIV_COUNTER_PW)
       center = 0;
   }
 
-  pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]),
-                     center);
+  // DMA-SAFE UPDATE
+  voice_write_pw(ch, center);
   PW[ch] = center;
-
-  if (autotuneDebug >= 2) {
-    Serial.println((String) "  [PW_HARDWARE] ch=" + ch + " GP" + PW_PINS[ch] +
-                   " -> PW_CENTER=" + center +
-                   " (Readback CC=" + pw_level_readback(ch) + ")");
-  }
+  flush_voice_pwm();
 }
 
 void apply_pw_center_solo(uint8_t soloCh) {
@@ -155,19 +148,21 @@ void apply_pw_center_solo(uint8_t soloCh) {
     if (ch == soloCh) {
       apply_pw_center(ch);
     } else {
-      pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]),
-                         0);
+      voice_write_pw(ch, 0);
+      PW[ch] = 0;
     }
   }
+  flush_voice_pwm();
 }
 
 static void reset_pw_to_DIV_COUNTER_PW() {
   for (int i = 0; i < NUM_PW_CHANNELS; i++) {
     if (PW_PINS[i] == PW_PIN_UNASSIGNED)
       continue;
-    pwm_set_chan_level(PW_PWM_SLICES[i], pwm_gpio_to_channel(PW_PINS[i]),
-                       DIV_COUNTER_PW);
+    voice_write_pw(i, DIV_COUNTER_PW);
+    PW[i] = DIV_COUNTER_PW;
   }
+  flush_voice_pwm();
 }
 
 static void restore_voice_engine_after_calibration() {
@@ -178,29 +173,27 @@ static void restore_voice_engine_after_calibration() {
   for (int i = 0; i < NUM_VOICES_TOTAL; i++) {
     note_on_flag[i] = 1;
   }
+  flush_voice_pwm();
 }
 
 static void disable_all_oscillators_and_range_pwm() {
-  // 1. Force all frequencies to 0, drive RESET pins LOW, and mute Range PWM
+  // 1. Force all frequencies to 0 and clamp physical RESET pins HIGH
   for (int i = 0; i < NUM_OSCILLATORS; i++) {
     PIO pioN = pio[VOICE_TO_PIO[i]];
     uint8_t sm = VOICE_TO_SM[i];
 
-    // Clear OSR divider to 0 and force the physical RESET pin HGIH (shorts the capacitor)
     pio_sm_set_enabled(pioN, sm, false);
     pio_sm_put(pioN, sm, 0);
     pio_sm_exec(pioN, sm, pio_encode_pull(false, false));
     pio_sm_exec(pioN, sm, pio_encode_set(pio_pins, 0));
     gpio_put(RESET_PINS[i], 1);
 
+    // FIXED: Loop across all NUM_OSCILLATORS (not just PW channels)
+    write_range_pwm(i, DIV_COUNTER); 
   }
   
-  for (int i = 0; i < NUM_PW_CHANNELS; i++) {
-    #ifndef RANGE0_PIO_DITHER_TEST
-    gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
-    #endif
-    write_range_pwm(i, DIV_COUNTER_PW); // max voltage to drive integrator output low
-  }
+  // 2. Commit range muting to DMA immediately
+  flush_voice_pwm();
 
   g_lastDrivenFreqHz = 0.0f;
 }
@@ -280,31 +273,32 @@ void apply_pw_baseline(uint8_t ch) {
   uint16_t level = PW_CENTER[ch];
 
   if (pwSweepMode == PW_SWEEP_FULL) {
-    // Only DCO4 requires the center to be strictly near the middle (512)
     if (level < (DIV_COUNTER_PW / 10) || level > (DIV_COUNTER_PW * 9 / 10)) {
       level = DIV_COUNTER_PW / 2;
     }
   } else {
-    // For DCO3 (Half sweep), center is SUPPOSED to be near 0 or 1024.
-    // We only clamp if it's completely uninitialized garbage.
     if (level > DIV_COUNTER_PW)
       level = 0;
   }
 
-  pwm_set_chan_level(PW_PWM_SLICES[ch], pwm_gpio_to_channel(PW_PINS[ch]),
-                     level);
+  // DMA-SAFE UPDATE
+  voice_write_pw(ch, level);
   PW[ch] = level;
+  flush_voice_pwm();
 }
 
-// Solos the active oscillator's PW baseline
 void apply_pw_baseline_solo(uint8_t soloCh) {
   for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
     if (PW_PINS[ch] == PW_PIN_UNASSIGNED)
       continue;
     if (ch == soloCh) {
       apply_pw_baseline(ch);
-    } 
+    } else {
+      voice_write_pw(ch, 0);
+      PW[ch] = 0;
+    }
   }
+  flush_voice_pwm();
 }
 
 // =============================================================================
@@ -537,9 +531,11 @@ static GapMeasurement set_pw_and_measure(uint8_t pwCh, uint16_t pw) {
   if (pwCh >= NUM_PW_CHANNELS || PW_PINS[pwCh] == PW_PIN_UNASSIGNED) {
     return {true, kGapTimeoutSentinel};
   }
-  pwm_set_chan_level(PW_PWM_SLICES[pwCh], pwm_gpio_to_channel(PW_PINS[pwCh]),
-                     pw);
+  // DMA-SAFE UPDATE
+  voice_write_pw(pwCh, pw);
   PW[pwCh] = pw;
+  flush_voice_pwm();
+  
   delay(30);
   return measure_gap(2);
 }
@@ -561,15 +557,14 @@ static GapMeasurement set_pw_and_measure(uint8_t pwCh, uint16_t pw) {
  * @return Measured duty fraction (0.0 .. 1.0), or -1.0 if pulse collapsed (dead-zone).
  */
  static double measure_pw_duty(uint8_t pwCh, uint16_t pw, double freqHz) {
-  // 1. Guard against invalid channels or unassigned pins
   if (pwCh >= NUM_PW_CHANNELS || PW_PINS[pwCh] == PW_PIN_UNASSIGNED)
     return -1.0;
 
-  // 2. Program the analog PW CV PWM hardware
-  pwm_set_chan_level(PW_PWM_SLICES[pwCh], pwm_gpio_to_channel(PW_PINS[pwCh]), pw);
+  // DMA-SAFE UPDATE
+  voice_write_pw(pwCh, pw);
   PW[pwCh] = pw;
+  flush_voice_pwm();
 
-  // 3. Baseline settling time: scaled to waveform periods & precision profile
   const CalPrecisionProfile &prec = cal_precision();
   wait_periods((float)freqHz, prec.settlePeriods, prec.settleMinMs * 1000u);
 
@@ -1543,13 +1538,13 @@ void run_pw_cv_probe() {
     if (PW_PINS[ch] == PW_PIN_UNASSIGNED)
       continue;
 
-    for (uint8_t z = 0; z < NUM_PW_CHANNELS; ++z) {
-      if (z != ch && PW_PINS[z] != PW_PIN_UNASSIGNED) {
-        pwm_set_chan_level(PW_PWM_SLICES[z], pwm_gpio_to_channel(PW_PINS[z]),
-                           0);
-        PW[z] = 0;
+      for (uint8_t z = 0; z < NUM_PW_CHANNELS; ++z) {
+        if (z != ch && PW_PINS[z] != PW_PIN_UNASSIGNED) {
+          voice_write_pw(z, 0);
+          PW[z] = 0;
+        }
       }
-    }
+      flush_voice_pwm();
 
     float dutyMin = 0.0f, dutyMax = 0.0f;
     uint8_t reads = 0;

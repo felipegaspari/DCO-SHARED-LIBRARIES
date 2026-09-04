@@ -413,28 +413,142 @@ double expInterpolationSolveY(double x, double x0, double x1, double y0,
                               double y1);
 
 // =============================================================================
+// PRECOMPUTE PW TRACK CACHE
+// =============================================================================
+
+#define PW_LUT_SIZE 512
+#define PW_LUT_MAX_FREQ AMP_COMP_MAX_HZ 
+constexpr float PW_LUT_BINS_PER_HZ = (float)(PW_LUT_SIZE - 1) / PW_LUT_MAX_FREQ;
+
+struct PWLutItem {
+    uint16_t base[2]; // [0]: low limit,       [1]: center
+    uint16_t span[2]; // [0]: (center - low),   [1]: (high - center)
+} __attribute__((aligned(8)));
+
+//  + 1 safety guard element
+PWLutItem pw_lut[NUM_PW_CHANNELS][PW_LUT_SIZE + 1];
+
+// Helper to sample the exact output of your original function at any frequency
+void get_exact_limits(uint8_t ch, float freq, float &c, float &l, float &h) {
+  const PWTrackCache &cache = pwTrackCache[ch];
+  const auto* limits = PW_CAL_LIMITS[ch]; 
+  float pwMax_f = (float)(DIV_COUNTER_PW - 1);
+  
+  if (freq >= cache.f1) {
+      if (freq < cache.f2) {
+          float t = __builtin_fminf(1.0f, (freq - cache.f1) * cache.invSpan12);
+          float c1 = (float)limits[1].center, l1 = (float)limits[1].lowLimit, h1 = (float)limits[1].highLimit;
+          c = __builtin_fmaf(t, (float)limits[2].center - c1, c1);
+          l = __builtin_fmaf(t, (float)limits[2].lowLimit - l1, l1);
+          h = __builtin_fmaf(t, (float)limits[2].highLimit - h1, h1);
+      } else {
+          c = (float)limits[2].center; l = (float)limits[2].lowLimit; h = (float)limits[2].highLimit;
+      }
+  } else {
+      if (freq >= cache.f0) {
+          float t = __builtin_fminf(1.0f, (freq - cache.f0) * cache.invSpan01);
+          float c0 = (float)limits[0].center, l0 = (float)limits[0].lowLimit, h0 = (float)limits[0].highLimit;
+          c = __builtin_fmaf(t, (float)limits[1].center - c0, c0);
+          l = __builtin_fmaf(t, (float)limits[1].lowLimit - l0, l0);
+          h = __builtin_fmaf(t, (float)limits[1].highLimit - h0, h0);
+      } else if (freq > 0.0f) {
+          float t = __builtin_fminf(1.0f, freq * cache.invF0); 
+          c = (float)limits[0].center; l = (float)limits[0].lowLimit;
+          h = __builtin_fmaf(t, (float)limits[0].highLimit - pwMax_f, pwMax_f);
+      } else { 
+          c = (float)limits[1].center; l = (float)limits[1].lowLimit; h = (float)limits[1].highLimit;
+      }
+  }
+}
+
+void precompute_pw_regions() {
+  for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ch++) {
+
+    constexpr float hz_step = PW_LUT_MAX_FREQ / (float)(PW_LUT_SIZE - 1);
+
+    for (int i = 0; i < PW_LUT_SIZE; i++) {
+        float freq = (float)i * hz_step;
+        float c, l, h;
+        get_exact_limits(ch, freq, c, l, h); // Your existing helper
+
+        // Round directly to integer counts
+        uint16_t c_u = (uint16_t)(c + 0.5f);
+        uint16_t l_u = (uint16_t)(l + 0.5f);
+        uint16_t h_u = (uint16_t)(h + 0.5f);
+
+        // Lower half (PWval 0 to 511): lowLim -> center
+        pw_lut[ch][i].base[0] = l_u;
+        pw_lut[ch][i].span[0] = (c_u > l_u) ? (c_u - l_u) : 0;
+
+        // Upper half (PWval 512 to 1023): center -> highLim
+        pw_lut[ch][i].base[1] = c_u;
+        pw_lut[ch][i].span[1] = (h_u > c_u) ? (h_u - c_u) : 0;
+    }
+  }
+}
+// =============================================================================
 // Dual-Engine 3-Point Key-Tracked Pulse-Width Interpolator
 // =============================================================================
 #ifdef USE_FLOAT_VOICE_TASK
 
+// faster LUT version
 // --- 1. FLOAT ENGINE (RP2350 with Hardware FPU) ---
-// TEMPLATE: Call this as get_PW_level_interpolated<PW_SWEEP_FULL>(...) etc.
+// TEMPLATE: Call this as get_PW_level_interpolated<PW_SWEEP_FULL>(...) etc. || PW_SWEEP_HALF_LOW || PW_SWEEP_HALF_HIGH || PW_SWEEP_FULL
 template <uint8_t SweepMode = PW_SWEEP_FULL>
 inline uint16_t SRAM_HOT(get_PW_level_interpolated)(uint16_t PWval, uint8_t oscN, float noteFreqHz = 0.0f, bool invertPolarity = PW_POLARITY_INVERTED) {
   const uint8_t ch = cal_pw_channel(oscN);
   if (__builtin_expect(ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED, 0)) return 0;
 
   constexpr int32_t pwMax = (int32_t)(DIV_COUNTER_PW - 1);
+  uint32_t val = (PWval > pwMax) ? pwMax : PWval; 
+  val = invertPolarity ? (pwMax - val) : val;
+
+  // 1. Direct integer frequency bin lookup (single conversion)
+  uint32_t idx = (noteFreqHz > 0.0f) ? (uint32_t)(noteFreqHz * PW_LUT_BINS_PER_HZ) : 0;
+  if (__builtin_expect(idx >= PW_LUT_SIZE, 0)) idx = PW_LUT_SIZE - 1;
+
+  const PWLutItem& item = pw_lut[ch][idx];
+
+  // 2. Pure Integer Math
+  if constexpr (SweepMode == PW_SWEEP_HALF_LOW) {
+      return item.base[0] + (uint16_t)((val * item.span[0]) / pwMax);
+  }
+  else if constexpr (SweepMode == PW_SWEEP_HALF_HIGH) {
+      return item.base[1] + (uint16_t)((val * item.span[1]) / pwMax);
+  }
+  else { // FULL SWEEP (Default)
+      // Pick lower half (0..511) or upper half (512..1023)
+      uint32_t h = (val >= 512);
+      uint32_t v = h ? (val - 512) : val;
+
+      return item.base[h] + (uint16_t)(((v * item.span[h]) + 256) >> 9);
+  }
+}
+
+//* Original function, MOST PRECISION. 2us EXECUTION TIME */
+// --- 1. FLOAT ENGINE (RP2350 with Hardware FPU) ---
+// TEMPLATE: Call this as get_PW_level_interpolated<PW_SWEEP_FULL>(...)  || PW_SWEEP_HALF_LOW || PW_SWEEP_HALF_HIGH || PW_SWEEP_FULL
+/*
+template <uint8_t SweepMode = PW_SWEEP_FULL>
+inline uint16_t SRAM_HOT(get_PW_level_interpolated)(
+    uint16_t PWval, uint8_t oscN, float noteFreqHz = 0.0f,
+    bool invertPolarity = PW_POLARITY_INVERTED) {
+  const uint8_t ch = cal_pw_channel(oscN);
+  if (__builtin_expect(
+          ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED, 0))
+    return 0;
+
+  constexpr int32_t pwMax = (int32_t)(DIV_COUNTER_PW - 1);
   constexpr float pwMax_f = (float)pwMax;
   constexpr float divCounterPw_f = (float)DIV_COUNTER_PW;
 
   // Branchless (IT block) clamping and polarity mapping
-  uint32_t val = (PWval > pwMax) ? pwMax : PWval; 
+  uint32_t val = (PWval > pwMax) ? pwMax : PWval;
   val = invertPolarity ? (pwMax - val) : val;
   float val_f = (float)val;
 
   const PWTrackCache &cache = pwTrackCache[ch];
-  const auto* __restrict limits = PW_CAL_LIMITS[ch]; 
+  const auto *__restrict limits = PW_CAL_LIMITS[ch];
 
   float center_f, lowLim_f, highLim_f;
 
@@ -443,35 +557,42 @@ inline uint16_t SRAM_HOT(get_PW_level_interpolated)(uint16_t PWval, uint8_t oscN
   // ------------------------------------------------------------------------
   if (noteFreqHz >= cache.f1) {
     if (noteFreqHz < cache.f2) {
-      float t = __builtin_fminf(1.0f, (noteFreqHz - cache.f1) * cache.invSpan12);
-      float c1 = (float)limits[1].center, l1 = (float)limits[1].lowLimit, h1 = (float)limits[1].highLimit;
-      
-      center_f  = __builtin_fmaf(t, (float)limits[2].center - c1, c1);
-      lowLim_f  = __builtin_fmaf(t, (float)limits[2].lowLimit - l1, l1);
+      float t =
+          __builtin_fminf(1.0f, (noteFreqHz - cache.f1) * cache.invSpan12);
+      float c1 = (float)limits[1].center, l1 = (float)limits[1].lowLimit,
+            h1 = (float)limits[1].highLimit;
+
+      center_f = __builtin_fmaf(t, (float)limits[2].center - c1, c1);
+      lowLim_f = __builtin_fmaf(t, (float)limits[2].lowLimit - l1, l1);
       highLim_f = __builtin_fmaf(t, (float)limits[2].highLimit - h1, h1);
     } else {
-      center_f  = (float)limits[2].center;
-      lowLim_f  = (float)limits[2].lowLimit;
+      center_f = (float)limits[2].center;
+      lowLim_f = (float)limits[2].lowLimit;
       highLim_f = (float)limits[2].highLimit;
     }
+
   } else {
     if (noteFreqHz >= cache.f0) {
-      float t = __builtin_fminf(1.0f, (noteFreqHz - cache.f0) * cache.invSpan01);
-      float c0 = (float)limits[0].center, l0 = (float)limits[0].lowLimit, h0 = (float)limits[0].highLimit;
-      
-      center_f  = __builtin_fmaf(t, (float)limits[1].center - c0, c0);
-      lowLim_f  = __builtin_fmaf(t, (float)limits[1].lowLimit - l0, l0);
+      float t =
+          __builtin_fminf(1.0f, (noteFreqHz - cache.f0) * cache.invSpan01);
+      float c0 = (float)limits[0].center, l0 = (float)limits[0].lowLimit,
+            h0 = (float)limits[0].highLimit;
+
+      center_f = __builtin_fmaf(t, (float)limits[1].center - c0, c0);
+      lowLim_f = __builtin_fmaf(t, (float)limits[1].lowLimit - l0, l0);
       highLim_f = __builtin_fmaf(t, (float)limits[1].highLimit - h0, h0);
     } else if (noteFreqHz > 0.0f) {
       // 1-Cycle multiply replaces the 14-cycle VDIV instruction
-      float t = __builtin_fminf(1.0f, __builtin_fmaxf(0.0f, noteFreqHz * cache.invF0)); 
-      
-      center_f  = (float)limits[0].center;
-      lowLim_f  = (float)limits[0].lowLimit;
-      highLim_f = __builtin_fmaf(t, (float)limits[0].highLimit - pwMax_f, pwMax_f);
-    }  else { // <= 0 edge case
-      center_f  = (float)limits[1].center;
-      lowLim_f  = (float)limits[1].lowLimit;
+      float t = __builtin_fminf(
+          1.0f, __builtin_fmaxf(0.0f, noteFreqHz * cache.invF0));
+
+      center_f = (float)limits[0].center;
+      lowLim_f = (float)limits[0].lowLimit;
+      highLim_f =
+          __builtin_fmaf(t, (float)limits[0].highLimit - pwMax_f, pwMax_f);
+    } else { // <= 0 edge case
+      center_f = (float)limits[1].center;
+      lowLim_f = (float)limits[1].lowLimit;
       highLim_f = (float)limits[1].highLimit;
     }
   }
@@ -480,134 +601,79 @@ inline uint16_t SRAM_HOT(get_PW_level_interpolated)(uint16_t PWval, uint8_t oscN
   // BRANCHLESS SWEEP MODE EVALUATION (Resolved at compile-time)
   // ------------------------------------------------------------------------
   float out_f;
-  
+
   if constexpr (SweepMode == PW_SWEEP_HALF_LOW) {
-    out_f = __builtin_fmaf(lowLim_f - center_f, val_f * (1.0f / pwMax_f), center_f);
-  } 
-  else if constexpr (SweepMode == PW_SWEEP_HALF_HIGH) {
-    out_f = __builtin_fmaf(highLim_f - center_f, val_f * (1.0f / pwMax_f), center_f);
-  } 
-  else { // FULL
+    out_f =
+        __builtin_fmaf(lowLim_f - center_f, val_f * (1.0f / pwMax_f), center_f);
+  } else if constexpr (SweepMode == PW_SWEEP_HALF_HIGH) {
+    out_f = __builtin_fmaf(highLim_f - center_f, val_f * (1.0f / pwMax_f),
+                           center_f);
+  } else { // FULL
     constexpr float inv512 = 1.0f / 512.0f;
     float x = val_f * inv512; // Maps [0, 1024] to [0.0, 2.0]
-    
-    // 1-cycle Hardware Clamping splits the signal mathematically instead of branching
-    float x0 = __builtin_fminf(x, 1.0f);          // Clamps to [0, 1] for the bottom half
-    float x1 = __builtin_fmaxf(x - 1.0f, 0.0f);   // Clamps to [0, 1] for the top half
-    
+
+    // 1-cycle Hardware Clamping splits the signal mathematically instead of
+    // branching
+    float x0 = __builtin_fminf(x, 1.0f); // Clamps to [0, 1] for the bottom half
+    float x1 =
+        __builtin_fmaxf(x - 1.0f, 0.0f); // Clamps to [0, 1] for the top half
+
     // FMA Pipelined math: low + x0*(center-low) + x1*(high-center)
     float lower_lerp = __builtin_fmaf(x0, center_f - lowLim_f, lowLim_f);
     out_f = __builtin_fmaf(x1, highLim_f - center_f, lower_lerp);
   }
-
   // Final clamp and hardware float-to-int conversion
   out_f = __builtin_fmaxf(0.0f, __builtin_fminf(divCounterPw_f, out_f + 0.5f));
   return (uint16_t)(int32_t)out_f;
 }
+*/
+
 #else
 
 // --- 2. FIXED-POINT ENGINE (RP2040: Zero-Float, Hardware SIO Math) ---
-uint16_t SRAM_HOT(get_PW_level_interpolated)(
+template <uint8_t SweepMode = PW_SWEEP_FULL>
+inline uint16_t SRAM_HOT(get_PW_level_interpolated)(
     uint16_t PWval, uint8_t oscN,
     int64_t noteFreqQ24 = 0, // Guarded against 32-bit overflow
     bool invertPolarity = PW_POLARITY_INVERTED) {
+    
   const uint8_t ch = cal_pw_channel(oscN);
-  if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED)
-    return 0;
+  if (__builtin_expect(ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED, 0)) return 0;
 
   constexpr int32_t pwMax = (int32_t)(DIV_COUNTER_PW - 1);
+  uint32_t val = (PWval > pwMax) ? pwMax : PWval; 
+  val = invertPolarity ? (pwMax - val) : val;
 
-  int32_t val = (int32_t)PWval;
-  if (val > pwMax)
-    val = pwMax;
-  if (invertPolarity)
-    val = pwMax - val;
+  // 1. Fixed-Point Frequency Bin Lookup
+  // Shift Q24 down to Q16. This safely fits a 12,500 Hz frequency into a 32-bit integer.
+  uint32_t freq_Q16 = (noteFreqQ24 > 0) ? (uint32_t)(noteFreqQ24 >> 8) : 0;
+  
+  // Precalculate the LUT multiplier in Q16 format
+  constexpr uint32_t BINS_PER_HZ_Q16 = (uint32_t)(PW_LUT_BINS_PER_HZ * 65536.0f);
+  
+  // 32x32 -> 64-bit multiply. 
+  // Shifting right by 32 is free (the CPU just reads the high register).
+  uint32_t idx = ((uint64_t)freq_Q16 * BINS_PER_HZ_Q16) >> 32;
 
-  const PWTrackCache &cache = pwTrackCache[ch];
-  int32_t center, lowLim, highLim;
+  // Bounds clamp
+  if (__builtin_expect(idx >= PW_LUT_SIZE, 0)) idx = PW_LUT_SIZE - 1;
 
-  if (noteFreqQ24 <= 0) {
-    center = (int32_t)PW_CAL_LIMITS[ch][1].center;
-    lowLim = (int32_t)PW_CAL_LIMITS[ch][1].lowLimit;
-    highLim = (int32_t)PW_CAL_LIMITS[ch][1].highLimit;
-  } else if (noteFreqQ24 < (int64_t)cache.f0) {
-    uint32_t f_q10  = (uint32_t)(noteFreqQ24 >> 14);
-    uint32_t f0_q10 = (uint32_t)(((int64_t)cache.f0) >> 14);
-    uint32_t t_q15  = (f0_q10 > 0) ? ((f_q10 << 15) / f0_q10) : 0;
-    if (t_q15 > 32768) t_q15 = 32768;
+  const PWLutItem& item = pw_lut[ch][idx];
 
-    center  = (int32_t)PW_CAL_LIMITS[ch][0].center;
-    lowLim  = (int32_t)PW_CAL_LIMITS[ch][0].lowLimit; // Protected bottom clamp
-    int32_t highDiff = pwMax - (int32_t)PW_CAL_LIMITS[ch][0].highLimit;
-    highLim = pwMax - (int32_t)((t_q15 * highDiff) >> 15); // Upward expansion for 98% precision
-  } else if (noteFreqQ24 <= (int64_t)cache.f1) {
-    uint32_t deltaF = (uint32_t)(noteFreqQ24 - cache.f0);
-    uint32_t t_q15 = (uint32_t)(((uint64_t)deltaF * cache.invSpan01_q24) >> 16);
-    if (t_q15 > 32768)
-      t_q15 = 32768;
-
-    center = (int32_t)PW_CAL_LIMITS[ch][0].center +
-             ((((int32_t)PW_CAL_LIMITS[ch][1].center -
-                (int32_t)PW_CAL_LIMITS[ch][0].center) *
-               (int32_t)t_q15) >>
-              15);
-    lowLim = (int32_t)PW_CAL_LIMITS[ch][0].lowLimit +
-             ((((int32_t)PW_CAL_LIMITS[ch][1].lowLimit -
-                (int32_t)PW_CAL_LIMITS[ch][0].lowLimit) *
-               (int32_t)t_q15) >>
-              15);
-    highLim = (int32_t)PW_CAL_LIMITS[ch][0].highLimit +
-              ((((int32_t)PW_CAL_LIMITS[ch][1].highLimit -
-                 (int32_t)PW_CAL_LIMITS[ch][0].highLimit) *
-                (int32_t)t_q15) >>
-               15);
-  } else if (noteFreqQ24 < (int64_t)cache.f2) {
-    uint32_t deltaF = (uint32_t)(noteFreqQ24 - cache.f1);
-    uint32_t t_q15 = (uint32_t)(((uint64_t)deltaF * cache.invSpan12_q24) >> 16);
-    if (t_q15 > 32768)
-      t_q15 = 32768;
-
-    center = (int32_t)PW_CAL_LIMITS[ch][1].center +
-             ((((int32_t)PW_CAL_LIMITS[ch][2].center -
-                (int32_t)PW_CAL_LIMITS[ch][1].center) *
-               (int32_t)t_q15) >>
-              15);
-    lowLim = (int32_t)PW_CAL_LIMITS[ch][1].lowLimit +
-             ((((int32_t)PW_CAL_LIMITS[ch][2].lowLimit -
-                (int32_t)PW_CAL_LIMITS[ch][1].lowLimit) *
-               (int32_t)t_q15) >>
-              15);
-    highLim = (int32_t)PW_CAL_LIMITS[ch][1].highLimit +
-              ((((int32_t)PW_CAL_LIMITS[ch][2].highLimit -
-                 (int32_t)PW_CAL_LIMITS[ch][1].highLimit) *
-                (int32_t)t_q15) >>
-               15);
-  } else {
-    center = (int32_t)PW_CAL_LIMITS[ch][2].center;
-    lowLim = (int32_t)PW_CAL_LIMITS[ch][2].lowLimit;
-    highLim = (int32_t)PW_CAL_LIMITS[ch][2].highLimit;
+  // 2. Pure Integer Math (Identical to your chosen version)
+  if constexpr (SweepMode == PW_SWEEP_HALF_LOW) {
+      return item.base[0] + (uint16_t)((val * item.span[0]) / pwMax);
   }
-
-  // Fast integer mapping
-  int32_t out;
-  if (pwSweepMode == PW_SWEEP_HALF_LOW) {
-    out = center + (((lowLim - center) * val) / pwMax);
-  } else if (pwSweepMode == PW_SWEEP_HALF_HIGH) {
-    out = center + (((highLim - center) * val) / pwMax);
-  } else {
-    // Ultra-fast 1-cycle bitshift for Full Mode Split (val / 512)
-    if (val >= 512) {
-      out = center + (((highLim - center) * (val - 512)) >> 9);
-    } else {
-      out = lowLim + (((center - lowLim) * val) >> 9);
-    }
+  else if constexpr (SweepMode == PW_SWEEP_HALF_HIGH) {
+      return item.base[1] + (uint16_t)((val * item.span[1]) / pwMax);
   }
+  else { // FULL SWEEP (Default)
+      // Pick lower half (0..511) or upper half (512..1023)
+      uint32_t h = (val >= 512);
+      uint32_t v = h ? (val - 512) : val;
 
-  if (out < 0)
-    return 0;
-  if (out > DIV_COUNTER_PW)
-    return DIV_COUNTER_PW;
-  return (uint16_t)out;
+      return item.base[h] + (uint16_t)(((v * item.span[h]) + 256) >> 9);
+  }
 }
 #endif // USE_FLOAT_VOICE_TASK
 
