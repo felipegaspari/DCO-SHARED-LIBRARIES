@@ -16,14 +16,14 @@
    uint8_t&  dcoIndex;             ///< Reference to current oscillator under calibration.
    uint8_t&  currentNote;          ///< Reference to current MIDI note index being tuned.
    uint32_t* calibrationData;      ///< Pointer to working calibration buffer.
-   int8_t*   manualOffsetByOsc;    ///< Pointer to per-oscillator manual offset array.
+   int16_t*   manualOffsetByOsc;    ///< Pointer to per-oscillator manual offset array.
    uint16_t* initManualAmpByOsc;   ///< Pointer to initial manual amplitude values.
  
    DCOCalibrationContext(
      uint8_t& dcoIndexRef,
      uint8_t& currentNoteRef,
      uint32_t* calibrationDataPtr,
-     int8_t* manualOffsetPtr,
+     int16_t* manualOffsetPtr,
      uint16_t* initManualAmpPtr
    ) : dcoIndex(dcoIndexRef),
        currentNote(currentNoteRef),

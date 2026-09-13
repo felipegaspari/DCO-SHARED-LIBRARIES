@@ -144,10 +144,9 @@ static inline __attribute__((always_inline)) SRAM_HOT(uint32_t clkdiv_q16_total_
      // ARM Cortex-M33 FPU processes sys_hz_f / 0.0f to +Infinity without crashing.
      // We let the FPU do the math unconditionally to avoid pipeline flushes.
      float cycles = (sys_hz_f / hz) + 0.5f;
-     cycles = fminf(cycles, 4.0e9f);
      
      // Ternary operator forces GCC to emit a conditional MOV (IT block) instead of a branch
-     return (hz > 0.0f) ? (uint32_t)cycles : 0; 
+     return (uint32_t)__builtin_fminf(cycles, 4.0e9f); 
  }
  
  /**

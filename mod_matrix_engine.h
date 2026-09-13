@@ -348,7 +348,7 @@
      if constexpr (dest == DEST_PITCH || dest == DEST_OSC1_PITCH || dest == DEST_OSC2_PITCH) {
          return raw_sum >> 2; 
      } else if constexpr (dest == DEST_PW) {
-         return raw_sum >> 18; 
+         return raw_sum >> 17; 
      } else if constexpr (dest == DEST_VCF_RESO) {
          return raw_sum >> 16;
      } else if constexpr (dest == DEST_VCA_LEVEL) {

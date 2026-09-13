@@ -41,7 +41,6 @@ static const MidiCcEntry midiCcMap[] = {
   {  18, PARAM_OSC1_TRI_ENABLE,            0,     1, MIDI_CC_LINEAR },
   { 112, PARAM_OSC2_SAW_ENABLE,            0,     1, MIDI_CC_LINEAR },
   { 113, PARAM_OSC2_PULSE_ENABLE,          0,     1, MIDI_CC_LINEAR },
-  { 114, PARAM_OSC2_TRI_ENABLE,            0,     1, MIDI_CC_LINEAR },
   { 115, PARAM_OSC3_SAW_ENABLE,            0,     1, MIDI_CC_LINEAR },
   { 116, PARAM_OSC3_PULSE_ENABLE,          0,     1, MIDI_CC_LINEAR },
   { 117, PARAM_OSC3_TRI_ENABLE,            0,     1, MIDI_CC_LINEAR },

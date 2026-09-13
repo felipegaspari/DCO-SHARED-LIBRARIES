@@ -234,39 +234,68 @@ struct PioPeriod {
 // `mov x, OSR` chunk reads. A Y update on a running SM therefore leaves a window where a
 // chunk can latch the pulse width as its ramp count. Callers must only push Y while the SM
 // is stopped, which in practice means at note-on.
-static inline SRAM_HOT(PioPeriod pio_period_split)(uint32_t total_cycles,
-                                         uint32_t weight,
-                                         uint32_t overhead) {
-  PioPeriod p;
+static inline PioPeriod SRAM_HOT(pio_period_split)(uint32_t total_cycles,
+  uint32_t weight,
+  uint32_t overhead) {
+PioPeriod p;
 
-  // Guard the subtraction: very high frequencies can leave no room for a ramp.
-  uint32_t fixed = overhead + pioPulseLength;
-  if (total_cycles <= fixed) {
-    p.clk_div = 0;
-    p.y = pioPulseLength;
-    return p;
-  }
+uint32_t fixed = overhead + pioPulseLength;
+if (__builtin_expect(total_cycles <= fixed, 0)) {
+p.clk_div = 0;
+p.y = pioPulseLength;
+return p;
+}
 
-  uint32_t ramp = total_cycles - fixed;
-  p.clk_div = ramp / weight;
-  p.y = pioPulseLength + (ramp % weight);
-  return p;
+uint32_t ramp = total_cycles - fixed;
+
+switch (weight) {
+case 4: 
+p.clk_div = ramp / 4u; 
+p.y = pioPulseLength + (ramp % 4u);
+break;
+case 5: 
+p.clk_div = ramp / 5u; 
+p.y = pioPulseLength + (ramp % 5u); 
+break;
+case 6: 
+p.clk_div = ramp / 6u; 
+p.y = pioPulseLength + (ramp % 6u); 
+break;
+case 7: 
+p.clk_div = ramp / 7u; 
+p.y = pioPulseLength + (ramp % 7u); 
+break;
+default:
+p.clk_div = ramp / weight;
+p.y = pioPulseLength + (ramp % weight);
+break;
+}
+
+return p;
 }
 
  
- /**
-  * RP2350 OPTIMIZED: Branchless Clock Divider
-  */
+/**
+ * RP2350 OPTIMIZED: Branchless Clock Divider with Magic Division
+ */
  static inline __attribute__((always_inline)) 
- SRAM_HOT(uint32_t pio_clk_div_for_y)(uint32_t total_cycles, uint32_t y, uint32_t weight, uint32_t overhead) {
+ uint32_t SRAM_HOT(pio_clk_div_for_y)(uint32_t total_cycles, uint32_t y, uint32_t weight, uint32_t overhead) {
      const uint32_t fixed = overhead + y;
+     
+     // Fast exit before doing math
+     if (__builtin_expect(total_cycles <= fixed, 0)) return 0;
+     
      const uint32_t ramp = total_cycles - fixed;
      
-     // weight / 2u is replaced by a 1-cycle bitshift (weight >> 1)
-     const uint32_t div = (ramp + (weight >> 1)) / weight;
-     
-     // Ternary avoids the 'if (total_cycles <= fixed) return 0;' branch penalty
-     return (total_cycles > fixed) ? div : 0;
+     // Explicit constants allow GCC to replace 32-cycle hardware divisions (UDIV) 
+     // with 1-cycle Bitshifts (LSR) and Magic Multiplications (UMULL).
+     switch (weight) {
+         case 4: return (ramp + 2u) / 4u; // Compiles to simple bitshift >> 2
+         case 5: return (ramp + 2u) / 5u; // Compiles to magic multiply
+         case 6: return (ramp + 3u) / 6u;
+         case 7: return (ramp + 3u) / 7u;
+         default: return (ramp + (weight >> 1)) / weight; // Fallback
+     }
  }
  
 /**

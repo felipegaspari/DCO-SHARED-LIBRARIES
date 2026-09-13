@@ -13,7 +13,7 @@ constexpr int32_t kManualGapTimeoutDutyErrTimes100 = 99999;
 
 // Edge timing limits
 constexpr unsigned long kGapTimeoutUs      = 100000UL;  // 100 ms baseline timeout
-constexpr unsigned long kGapTimeoutMaxUs   = 400000UL;  // 400 ms ceiling at ultra-low freq
+constexpr unsigned long kGapTimeoutMaxUs   = 500000UL;  // 500 ms ceiling at ultra-low freq
 constexpr double        kGapTimeoutPeriods = 2.5;       // Period multiple for timeout deadline
 
 // Dynamic Edge Debouncing
@@ -24,7 +24,7 @@ constexpr unsigned long kEdgeDebounceCeilUs         = 25UL;   // 25 µs ceiling 
 // Sampling segment counts
 constexpr uint16_t kGapSamplesDefault    = 6;
 constexpr uint16_t kGapSamplesHiRes      = 12;
-constexpr uint16_t kGapSamplesVeryLowMin = 12;  // Floor for < 30 Hz
+constexpr uint16_t kGapSamplesVeryLowMin = 4;  // Floor for < 30 Hz
 
 // Calibration Sense Pin Polarity
 constexpr bool kGapPolarityInverted = false;    // Set true if cal pin is inverted vs DCO output
@@ -67,7 +67,7 @@ constexpr CalPrecisionProfile kCalPrecisionFast = {
   /* gapSamplesMin       */ 4,
   /* gapSamplesMax       */ 32,
   /* gapWindowMs         */ 12,
-  /* gapMaxWindowMs      */ 200,
+  /* gapMaxWindowMs      */ 100,
   /* settlePeriods       */ 1.0f,
   /* settleMinMs         */ 2,
   /* bisectDutyTol       */ 0.0010,
@@ -91,7 +91,7 @@ constexpr CalPrecisionProfile kCalPrecisionNormal = {
   /* gapSamplesMin       */ 6,
   /* gapSamplesMax       */ 32,
   /* gapWindowMs         */ 25,
-  /* gapMaxWindowMs      */ 300,
+  /* gapMaxWindowMs      */ 200,
   /* settlePeriods       */ 1.0f,
   /* settleMinMs         */ 3,
   /* bisectDutyTol       */ 0.0005,
@@ -113,7 +113,7 @@ constexpr CalPrecisionProfile kCalPrecisionNormal = {
 // Fine build: highest quality refinement / verification pass
 constexpr CalPrecisionProfile kCalPrecisionFine = {
   /* gapSamplesMin       */ 12,
-  /* gapSamplesMax       */ 256,
+  /* gapSamplesMax       */ 64,
   /* gapWindowMs         */ 60,
   /* gapMaxWindowMs      */ 300,
   /* settlePeriods       */ 1.0f,
@@ -168,7 +168,7 @@ constexpr float kHuntStepMaxCents             = 600.0f;
 constexpr float    kAmp0BandRatio          = 2.5f;
 constexpr float    kAmp0MinFreqHz          = 5.0f;
 constexpr int      kAmp0FitPoints          = 5;
-constexpr float    kAmp0StoreFloorHz       = 2.0f;
+constexpr float    kAmp0StoreFloorHz       = 0.1f;
 constexpr int      kAmp0ScanPoints         = 10;
 constexpr uint32_t kAmp0ScanSettleMs       = 20;
 constexpr float    kGapPeriodTolRatio      = 0.15f;

@@ -149,7 +149,7 @@ extern uint8_t autotuneAmpMethod;
 extern uint8_t autotuneSearchMode;
 
 extern uint8_t manualCalibrationStage;
-extern int8_t manualCalibrationOffset[NUM_OSCILLATORS];
+extern int16_t manualCalibrationOffset[NUM_OSCILLATORS];
 extern uint8_t manualCalibrationStep;
 extern uint16_t ampComp440[NUM_OSCILLATORS];
 extern int16_t ampCompDutyOffset[NUM_OSCILLATORS];
@@ -491,6 +491,7 @@ void precompute_pw_regions() {
 // =============================================================================
 #ifdef USE_FLOAT_VOICE_TASK
 
+static constexpr uint16_t half_DIV_COUNTER_PW = DIV_COUNTER_PW / 2;
 // faster LUT version
 // --- 1. FLOAT ENGINE (RP2350 with Hardware FPU) ---
 // TEMPLATE: Call this as get_PW_level_interpolated<PW_SWEEP_FULL>(...) etc. || PW_SWEEP_HALF_LOW || PW_SWEEP_HALF_HIGH || PW_SWEEP_FULL
@@ -518,10 +519,11 @@ inline uint16_t SRAM_HOT(get_PW_level_interpolated)(uint16_t PWval, uint8_t oscN
   }
   else { // FULL SWEEP (Default)
       // Pick lower half (0..511) or upper half (512..1023)
-      uint32_t h = (val >= 512);
-      uint32_t v = h ? (val - 512) : val;
+      uint32_t h = (val >= half_DIV_COUNTER_PW);
+      uint32_t v = h ? (val - half_DIV_COUNTER_PW) : val;
 
-      return item.base[h] + (uint16_t)(((v * item.span[h]) + 256) >> 9);
+      // Dynamically divides by half_DIV_COUNTER_PW with proper rounding (+ half / 2)
+      return item.base[h] + (uint16_t)(((v * item.span[h]) + (half_DIV_COUNTER_PW >> 1)) / half_DIV_COUNTER_PW);
   }
 }
 
@@ -630,6 +632,8 @@ inline uint16_t SRAM_HOT(get_PW_level_interpolated)(
 
 #else
 
+static constexpr uint16_t half_DIV_COUNTER_PW = DIV_COUNTER_PW / 2;
+
 // --- 2. FIXED-POINT ENGINE (RP2040: Zero-Float, Hardware SIO Math) ---
 template <uint8_t SweepMode = PW_SWEEP_FULL>
 inline uint16_t SRAM_HOT(get_PW_level_interpolated)(
@@ -669,10 +673,10 @@ inline uint16_t SRAM_HOT(get_PW_level_interpolated)(
   }
   else { // FULL SWEEP (Default)
       // Pick lower half (0..511) or upper half (512..1023)
-      uint32_t h = (val >= 512);
-      uint32_t v = h ? (val - 512) : val;
+      uint32_t h = (val >= half_DIV_COUNTER_PW);
+      uint32_t v = h ? (val - half_DIV_COUNTER_PW) : val;
 
-      return item.base[h] + (uint16_t)(((v * item.span[h]) + 256) >> 9);
+      return item.base[h] + (uint16_t)(((v * item.span[h]) + (half_DIV_COUNTER_PW >> 1)) / half_DIV_COUNTER_PW);
   }
 }
 #endif // USE_FLOAT_VOICE_TASK

@@ -22,6 +22,7 @@
  #define PWM_DITHER_STEPS         (1 << PWM_DITHER_BITS)
  #define PWM_DITHER_BYTES         (PWM_DITHER_STEPS * 4)
  #define PWM_DMA_RING_SIZE_BITS   (PWM_DITHER_BITS + 2) 
+ #define ENABLE_PW_DITHER         1  // 1 = DMA Dithered, 0 = Native 10-bit hardware write
  
  static constexpr uint32_t RANGE_PIO_FRAMES = 3;
  static constexpr uint32_t RANGE_PIO_PERIOD = DIV_COUNTER / RANGE_PIO_FRAMES;
@@ -62,18 +63,7 @@
    RANGE_PWM[osc] = level;
  #endif
  }
- 
- void SRAM_HOT(voice_write_range_pair)(uint8_t dcoA, uint8_t dcoB, uint16_t chanA, uint16_t chanB) {
-   if (char_amp_scale_q15) {
-     const int32_t amp_j = character_amp_delta();
-     write_range_pwm(dcoA, character_clamp_amp((int32_t)chanA + amp_j));
-     write_range_pwm(dcoB, character_clamp_amp((int32_t)chanB + amp_j));
-   } else {
-     write_range_pwm(dcoA, chanA);
-     write_range_pwm(dcoB, chanB);
-   }
- }
- 
+
 // -----------------------------------------------------------------------------
 // DYNAMIC COMPILE-TIME BAYER BITMASK GENERATOR (Only 32 Bytes!)
 // -----------------------------------------------------------------------------

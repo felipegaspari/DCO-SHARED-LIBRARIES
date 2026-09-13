@@ -32,7 +32,7 @@ uint8_t autotuneAmpMethod = (uint8_t)AUTOTUNE_AMP_METHOD_DEFAULT;
 uint8_t autotuneSearchMode = (uint8_t)AUTOTUNE_SEARCH_MODE_DEFAULT;
 
 uint8_t manualCalibrationStage = 0;
-int8_t manualCalibrationOffset[NUM_OSCILLATORS] = {0};
+int16_t manualCalibrationOffset[NUM_OSCILLATORS] = {0};
 uint8_t manualCalibrationStep = 0;
 uint16_t ampComp440[NUM_OSCILLATORS] = {0};
 int16_t ampCompDutyOffset[NUM_OSCILLATORS] = {0};
@@ -182,19 +182,33 @@ static void disable_all_oscillators_and_range_pwm() {
     PIO pioN = pio[VOICE_TO_PIO[i]];
     uint8_t sm = VOICE_TO_SM[i];
 
-    pio_sm_set_enabled(pioN, sm, false);
-    pio_sm_put(pioN, sm, 0);
-    pio_sm_exec(pioN, sm, pio_encode_pull(false, false));
-    pio_sm_exec(pioN, sm, pio_encode_set(pio_pins, 0));
-    gpio_put(RESET_PINS[i], 1);
-
-    // FIXED: Loop across all NUM_OSCILLATORS (not just PW channels)
-    write_range_pwm(i, DIV_COUNTER); 
+    if (i == currentDCO) {
+      pio_sm_set_enabled(pioN, sm, true);
+      pio_sm_put(pioN, sm, get_osc_clk_div(i, 440.0f));
+      pio_sm_exec(pioN, sm, pio_encode_pull(false, true));
+      write_range_pwm(i, ampComp440[i]); // max voltage to drive integrator output low
+    } else {
+      pio_sm_set_enabled(pioN, sm, false);
+      pio_sm_put(pioN, sm, 0);
+      pio_sm_exec(pioN, sm, pio_encode_pull(false, false));
+      pio_sm_exec(pioN, sm, pio_encode_set(pio_pins, 0));
+      gpio_put(RESET_PINS[i], 1);
+      write_range_pwm(i, DIV_COUNTER); 
+    }
   }
   
+  for (int i = 0; i < NUM_PW_CHANNELS; i++) {
+    #ifndef RANGE0_PIO_DITHER_TEST
+    gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
+    #endif
+    if (( i / 2) == currentDCO) {
+    voice_write_pw(i, DIV_COUNTER_PW / 2); // max voltage to drive integrator output low
+    } else {
+      voice_write_pw(i, DIV_COUNTER_PW);
+  }
+  }
   // 2. Commit range muting to DMA immediately
   flush_voice_pwm();
-
   g_lastDrivenFreqHz = 0.0f;
 }
 
@@ -202,18 +216,32 @@ static void disable_all_oscillators_and_range_pwm() {
  * @brief Prepares a single oscillator for calibration by muting all others,
  *        draining its capacitor, and kickstarting the target frequency.
  */
-void restart_DCO_calibration() {
+ void restart_DCO_calibration() {
   autotune_fill_init_manual_amp();
 
-  VOICE_NOTES[0] = DCO_calibration_start_note;
-  DCO_calibration_current_note = DCO_calibration_start_note;
+  // FIX: Pre-charge the RC filter to the 440 Hz Anchor if using FREQ_TRACE
+  if (autotuneAmpMethod == AMP_METHOD_FREQ_TRACE) {
+    VOICE_NOTES[0] = manual_cal_reference_note;
+    DCO_calibration_current_note = manual_cal_reference_note;
+  } else {
+    VOICE_NOTES[0] = DCO_calibration_start_note;
+    DCO_calibration_current_note = DCO_calibration_start_note;
+  }
 
   calibrationData[0] = 0;
   calibrationData[1] = ampCompLowestFreqVal;
   calibrationData[2] = (uint32_t)(note_to_freq(DCO_calibration_current_note -
                                                calibration_note_interval) * 100);
-  calibrationData[3] = initManualAmpCompCalibrationVal[currentDCO] +
-                       manualCalibrationOffset[currentDCO];
+  
+  if (autotuneAmpMethod == AMP_METHOD_FREQ_TRACE) {
+    calibrationData[3] = ampComp440[currentDCO];
+    if (calibrationData[3] < 10) { // Fallback if 440 is somehow zeroed
+      calibrationData[3] = (initManualAmpCompCalibrationVal[currentDCO] + manualCalibrationOffset[currentDCO]) * 4;
+    }
+  } else {
+    calibrationData[3] = initManualAmpCompCalibrationVal[currentDCO] +
+                         manualCalibrationOffset[currentDCO];
+  }
 
   DCOCalibrationStart = millis();
 
@@ -231,12 +259,11 @@ void restart_DCO_calibration() {
     apply_pw_baseline_solo(pwCh);
   }
 
-  // 3. APPLY STARTING AMPLITUDE & PITCH TO ACTIVE OSCILLATOR
-  ampCompCalibrationVal = initManualAmpCompCalibrationVal[currentDCO] +
-                          manualCalibrationOffset[currentDCO];
-  write_range_pwm(currentDCO, ampCompCalibrationVal);
+  delay(100);
 
-  // Kickstart frequency exactly how Manual Calibration does it
+  // 3. APPLY STARTING AMPLITUDE & PITCH TO ACTIVE OSCILLATOR
+  ampCompCalibrationVal = calibrationData[3];
+  write_range_pwm(currentDCO, ampCompCalibrationVal);
   autotune_drive_core(currentDCO, note_to_freq(DCO_calibration_current_note),
                       ampCompCalibrationVal);
 
@@ -278,7 +305,7 @@ void apply_pw_baseline(uint8_t ch) {
     }
   } else {
     if (level > DIV_COUNTER_PW)
-      level = 0;
+      level = DIV_COUNTER_PW;
   }
 
   // DMA-SAFE UPDATE
@@ -289,13 +316,11 @@ void apply_pw_baseline(uint8_t ch) {
 
 void apply_pw_baseline_solo(uint8_t soloCh) {
   for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
-    if (PW_PINS[ch] == PW_PIN_UNASSIGNED)
-      continue;
     if (ch == soloCh) {
       apply_pw_baseline(ch);
     } else {
-      voice_write_pw(ch, 0);
-      PW[ch] = 0;
+      voice_write_pw(ch, DIV_COUNTER_PW);
+      PW[ch] = DIV_COUNTER_PW;
     }
   }
   flush_voice_pwm();
@@ -410,16 +435,15 @@ float find_gap(uint8_t specialMode) {
     const uint32_t nowCycles = rp2040.getCycleCount();
     const unsigned long nowUs = micros();
 
-    // Differentiated timeouts:
-    // - (nowUs - lastEdgeTime > edgeTimeoutUs): The pin is silent/dead.
-    // - (nowUs - startUs > totalSessionTimeoutUs): Deadlock guard if noisy
-    // edges loop forever.
     if ((nowUs - lastEdgeTime) > edgeTimeoutUs ||
         (nowUs - startUs) > totalSessionTimeoutUs) {
       if (autotuneDebug >= 1) {
+        // FIX: Reverse-calculate the actual musical note dynamically for the debug log
+        int logNote = (freqHz > 0.0) ? (int)lround(12.0 * log2(freqHz / 440.0) + 69.0) : DCO_calibration_current_note;
+        
         Serial.println(
             (String) "  [GAP_TIMEOUT] DCO=" + currentDCO +
-            " Mode=" + specialMode + " Note=" + DCO_calibration_current_note +
+            " Mode=" + specialMode + " Note=" + logNote +
             " Freq=" + fmt_freq((float)freqHz) + "Hz" +
             " AMP=" + ampCompCalibrationVal + " EdgesSeen=" + edgesSeen +
             " Rej=" + edgesRejected + " Accepted=" + acceptedSamples + "/" +
@@ -1678,7 +1702,7 @@ void DCO_calibration() {
   Serial.println("[DCO_CAL] ---> DRAINING ANALOG BUS (Waiting for RC filters "
                  "to reach 0V)...");
   disable_all_oscillators_and_range_pwm();
-  delay(2500);
+  delay(1500);
   Serial.println("[DCO_CAL] ---> Analog bus stabilized. Beginning individual "
                  "DCO tuning.\n");
 
