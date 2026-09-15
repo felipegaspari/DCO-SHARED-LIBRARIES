@@ -124,20 +124,22 @@ inline void apply_pw_center(uint8_t ch) {
   if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED)
     return;
 
-  uint16_t center = PW_CENTER[ch];
+  // Direct hardware write: NO calculations, NO mode checks, NO overrides
+  voice_write_pw(ch, PW_CENTER[ch]);
+  PW[ch] = PW_CENTER[ch];
+  flush_voice_pwm();
+}
 
-  if (pwSweepMode == PW_SWEEP_FULL) {
-    if (center < (DIV_COUNTER_PW / 10) || center > (DIV_COUNTER_PW * 9 / 10)) {
-      center = DIV_COUNTER_PW / 2;
-    }
-  } else {
-    if (center > DIV_COUNTER_PW)
-      center = 0;
-  }
+// apply_pw_center_solo remains unchanged
+
+void apply_pw_baseline(uint8_t ch) {
+
+  // FIX: In HALF modes, default baseline is the 50% square (PW_LOW_LIMIT)
+  uint16_t level = (pwSweepMode == PW_SWEEP_FULL) ? PW_CENTER[ch] : PW_LOW_LIMIT[ch];
 
   // DMA-SAFE UPDATE
-  voice_write_pw(ch, center);
-  PW[ch] = center;
+  voice_write_pw(ch, level);
+  PW[ch] = level;
   flush_voice_pwm();
 }
 
@@ -148,13 +150,12 @@ void apply_pw_center_solo(uint8_t soloCh) {
     if (ch == soloCh) {
       apply_pw_center(ch);
     } else {
-      voice_write_pw(ch, 0);
-      PW[ch] = 0;
+      voice_write_pw(ch, MUTE_PW_CHANNEL);
+      PW[ch] = MUTE_PW_CHANNEL;
     }
   }
   flush_voice_pwm();
 }
-
 static void reset_pw_to_DIV_COUNTER_PW() {
   for (int i = 0; i < NUM_PW_CHANNELS; i++) {
     if (PW_PINS[i] == PW_PIN_UNASSIGNED)
@@ -202,9 +203,9 @@ static void disable_all_oscillators_and_range_pwm() {
     gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
     #endif
     if (( i / 2) == currentDCO) {
-    voice_write_pw(i, DIV_COUNTER_PW / 2); // max voltage to drive integrator output low
+    voice_write_pw(i, DIV_COUNTER_PW / 2); 
     } else {
-      voice_write_pw(i, DIV_COUNTER_PW);
+      voice_write_pw(i, MUTE_PW_CHANNEL); // max voltage to drive integrator output low
   }
   }
   // 2. Commit range muting to DMA immediately
@@ -290,37 +291,13 @@ static void disable_all_oscillators_and_range_pwm() {
   delay(150);
 }
 
-// Sets PW hardware to its neutral 50% duty baseline:
-// - FULL mode (DCO4): Center is mid-rail / stored PW_CENTER
-// - HALF mode (DCO3): Center is 0V / 0% duty (count 0)
-void apply_pw_baseline(uint8_t ch) {
-  if (ch >= NUM_PW_CHANNELS || PW_PINS[ch] == PW_PIN_UNASSIGNED)
-    return;
-
-  uint16_t level = PW_CENTER[ch];
-
-  if (pwSweepMode == PW_SWEEP_FULL) {
-    if (level < (DIV_COUNTER_PW / 10) || level > (DIV_COUNTER_PW * 9 / 10)) {
-      level = DIV_COUNTER_PW / 2;
-    }
-  } else {
-    if (level > DIV_COUNTER_PW)
-      level = DIV_COUNTER_PW;
-  }
-
-  // DMA-SAFE UPDATE
-  voice_write_pw(ch, level);
-  PW[ch] = level;
-  flush_voice_pwm();
-}
-
 void apply_pw_baseline_solo(uint8_t soloCh) {
   for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
     if (ch == soloCh) {
       apply_pw_baseline(ch);
     } else {
-      voice_write_pw(ch, DIV_COUNTER_PW);
-      PW[ch] = DIV_COUNTER_PW;
+      voice_write_pw(ch, MUTE_PW_CHANNEL);
+      PW[ch] = MUTE_PW_CHANNEL;
     }
   }
   flush_voice_pwm();
@@ -673,17 +650,13 @@ PWSearchResult find_pw_for_target_duty(uint8_t pwCh, double targetDutyFraction,
   // STAGE 1: REGRESSION / SECANT HUNT WITH 1-COUNT DECELERATION
   // =========================================================================
   for (int probe = 0; probe < maxProbes; ++probe) {
-    if (calibrationCancelRequested ||
-        (millis() - DCOCalibrationStart > 35000UL))
-      break;
+    if (calibrationCancelRequested || (millis() - DCOCalibrationStart > 35000UL)) break;
 
     int32_t testPW32 = (int32_t)lround(curPW);
     testPW32 = constrain(testPW32, (int32_t)pwMin, (int32_t)pwMax);
 
-    if (testPW32 <= deadLowPW)
-      testPW32 = deadLowPW + 1;
-    if (testPW32 >= deadHighPW)
-      testPW32 = deadHighPW - 1;
+    if (testPW32 <= deadLowPW) testPW32 = deadLowPW + 1;
+    if (testPW32 >= deadHighPW) testPW32 = deadHighPW - 1;
 
     if (testPW32 <= deadLowPW || testPW32 >= deadHighPW ||
         testPW32 < (int32_t)pwMin || testPW32 > (int32_t)pwMax) {
@@ -691,6 +664,12 @@ PWSearchResult find_pw_for_target_duty(uint8_t pwCh, double targetDutyFraction,
     }
 
     uint16_t testPW = (uint16_t)testPW32;
+
+    // FIX 2.1: If the algorithm is stuck proposing the exact same PW, we've hit a boundary
+    if (haveValid && testPW == p1_pw) {
+      break;
+    }
+
     double duty = measure_pw_duty(pwCh, testPW, freqHz);
     res.probes++;
 
@@ -699,13 +678,9 @@ PWSearchResult find_pw_for_target_duty(uint8_t pwCh, double targetDutyFraction,
       if (haveValid) {
         if (testPW < bestPW) {
           deadLowPW = max(deadLowPW, (int32_t)testPW);
-          if (bestPW - deadLowPW <= 1 && targetDutyFraction < bestDuty)
-            break;
           curPW = (double)(bestPW + deadLowPW) / 2.0;
         } else {
           deadHighPW = min(deadHighPW, (int32_t)testPW);
-          if (deadHighPW - bestPW <= 1 && targetDutyFraction > bestDuty)
-            break;
           curPW = (double)(bestPW + deadHighPW) / 2.0;
         }
       } else {
@@ -736,11 +711,6 @@ PWSearchResult find_pw_for_target_duty(uint8_t pwCh, double targetDutyFraction,
       break;
     }
 
-    if (err > 0.0 && (int32_t)testPW <= deadLowPW + 1)
-      break;
-    if (err < 0.0 && (int32_t)testPW >= deadHighPW - 1)
-      break;
-
     if (p0_pw < 0) {
       p0_pw = testPW;
       p0_duty = duty;
@@ -759,19 +729,23 @@ PWSearchResult find_pw_for_target_duty(uint8_t pwCh, double targetDutyFraction,
       double dir = (err > 0) ? -1.0 : 1.0;
       if (p0_pw >= 0 && p1_pw >= 0 && (p1_pw != p0_pw)) {
         double s = (p1_duty - p0_duty) / (double)(p1_pw - p0_pw);
-        if (s < 0.0)
-          dir = -dir;
+        if (s < 0.0) dir = -dir; // Reverses direction dynamically if polarity is negative!
       }
       int32_t step = (absErr < 0.008) ? 1 : 2;
       curPW = (double)testPW + (dir * step);
     } else if (p0_pw >= 0 && p1_pw >= 0 && fabs(p1_duty - p0_duty) > 1e-4) {
       double slope = (p1_duty - p0_duty) / (double)(p1_pw - p0_pw);
       double estPW = (double)testPW + (targetDutyFraction - duty) / slope;
-      double maxJump = (double)(pwMax - pwMin) * 0.25;
-      curPW = constrain(estPW, curPW - maxJump, curPW + maxJump);
+      double maxJump = (double)(pwMax - pwMin) * 0.35;
+      curPW = constrain(estPW, (double)testPW - maxJump, (double)testPW + maxJump);
     } else {
-      double delta = (targetDutyFraction - duty) * (double)(pwMax - pwMin);
-      curPW = (double)testPW + delta;
+      // FIX 2.2: Bootstrapping. We don't know the slope yet. 
+      // Safely step 10% into the remaining search space.
+      if (testPW < (pwMin + pwMax) / 2) {
+        curPW = testPW + (pwMax - pwMin) * 0.1;
+      } else {
+        curPW = testPW - (pwMax - pwMin) * 0.1;
+      }
     }
   }
 
@@ -905,68 +879,49 @@ void calibrate_pw_channel_3point(uint8_t ch, uint8_t osc) {
                    "] @ " + fmt_freq(freqHz) + " Hz (AMP=" + ampVal + ")");
 
     // A. Center Search (Target: 50%)
-    uint16_t minPW = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW / 4) : 0;
-    uint16_t maxPW = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW * 3 / 4)
-                                                    : (DIV_COUNTER_PW / 10);
-    uint16_t seedPW;
+// FIX: Dynamically set the 3 targets based on Sweep Mode
+double targetCenter = kPWCenterDutyFraction;
+double targetLow    = kPWLowDutyFraction;
+double targetHigh   = kPWHighDutyFraction;
 
-    if (calibrationPrecision == CAL_PRECISION_FINE &&
-        PW_CAL_LIMITS[ch][pt].center >= minPW &&
-        PW_CAL_LIMITS[ch][pt].center <= maxPW) {
-      seedPW = PW_CAL_LIMITS[ch][pt].center;
-    } else {
-      seedPW = (firstTuneFlag) ? (DIV_COUNTER_PW / 2) : PW_CENTER[ch];
-      if (seedPW < minPW || seedPW > maxPW)
-        seedPW = (minPW + maxPW) / 2;
-    }
+if (pwSweepMode == PW_SWEEP_HALF_HIGH) {
+  targetLow    = kPWCenterDutyFraction; // 50% (Slider 0)
+  targetCenter = 0.75;                  // 75% (Slider 50%)
+  targetHigh   = kPWHighDutyFraction;   // 96% (Slider 100%)
+} else if (pwSweepMode == PW_SWEEP_HALF_LOW) {
+  targetLow    = kPWCenterDutyFraction; // 50% (Slider 0)
+  targetCenter = 0.25;                  // 25% (Slider 50%)
+  targetHigh   = kPWLowDutyFraction;    //  4% (Slider 100%)
+}
 
-    PWSearchResult resCenter =
-        find_pw_for_target_duty(ch, kPWCenterDutyFraction, dutyTol, minPW,
-                                maxPW, seedPW, (double)freqHz);
-    uint16_t center = resCenter.ok ? resCenter.pw : PW_CENTER[ch];
+// A. Center Search (Target: 50%, 75%, or 25%)
+uint16_t seedCenter = PW_CAL_LIMITS[ch][pt].center;
+if (seedCenter == 0) seedCenter = DIV_COUNTER_PW / 2;
 
-    // B. Low Limit Search (Target: 2%)
-    uint16_t lowMin = 0;
-    uint16_t lowMax = (pwSweepMode == PW_SWEEP_FULL) ? center : DIV_COUNTER_PW;
-    uint16_t lowSeed = (calibrationPrecision == CAL_PRECISION_FINE &&
-                        PW_CAL_LIMITS[ch][pt].lowLimit > 0 &&
-                        PW_CAL_LIMITS[ch][pt].lowLimit <= lowMax)
-                           ? PW_CAL_LIMITS[ch][pt].lowLimit
-                           : (center * 0.15);
+PWSearchResult resCenter = find_pw_for_target_duty(
+    ch, targetCenter, dutyTol, 0, DIV_COUNTER_PW, seedCenter, (double)freqHz);
+uint16_t center = resCenter.ok ? resCenter.pw : PW_CENTER[ch];
 
-    PWSearchResult resLow;
-    if (pwSweepMode == PW_SWEEP_FULL || pwSweepMode == PW_SWEEP_HALF_LOW) {
-      resLow = find_pw_for_target_duty(ch, kPWLowDutyFraction, dutyTol, lowMin,
-                                       lowMax, lowSeed, (double)freqHz);
-    } else {
-      resLow = {true, center, kPWCenterDutyFraction, 0.0,
-                0}; // HALF_HIGH clones Center
-    }
+// B. Low Limit Search (Target: 4% or 50%)
+uint16_t seedLow = PW_CAL_LIMITS[ch][pt].lowLimit;
+if (seedLow == 0) seedLow = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW / 4) : center;
 
-    // C. High Limit Search (Target: 98%)
-    uint16_t highMin = (pwSweepMode == PW_SWEEP_FULL) ? center : 0;
-    uint16_t highMax = DIV_COUNTER_PW;
-    uint16_t highSeed = (calibrationPrecision == CAL_PRECISION_FINE &&
-                         PW_CAL_LIMITS[ch][pt].highLimit > highMin &&
-                         PW_CAL_LIMITS[ch][pt].highLimit < DIV_COUNTER_PW)
-                            ? PW_CAL_LIMITS[ch][pt].highLimit
-                            : (center + (DIV_COUNTER_PW - center) * 0.85);
+PWSearchResult resLow = find_pw_for_target_duty(
+    ch, targetLow, dutyTol, 0, DIV_COUNTER_PW, seedLow, (double)freqHz);
+uint16_t lowLimit = resLow.ok ? resLow.pw : ((pwSweepMode == PW_SWEEP_FULL) ? 0 : center);
 
-    PWSearchResult resHigh;
-    if (pwSweepMode == PW_SWEEP_FULL || pwSweepMode == PW_SWEEP_HALF_HIGH) {
-      resHigh =
-          find_pw_for_target_duty(ch, kPWHighDutyFraction, dutyTol, highMin,
-                                  highMax, highSeed, (double)freqHz);
-    } else {
-      resHigh = {true, center, kPWCenterDutyFraction, 0.0,
-                 0}; // HALF_LOW clones Center
-    }
+// C. High Limit Search (Target: 96% or 4%)
+uint16_t seedHigh = PW_CAL_LIMITS[ch][pt].highLimit;
+if (seedHigh == 0) seedHigh = (pwSweepMode == PW_SWEEP_FULL) ? (DIV_COUNTER_PW * 3 / 4) : center;
 
-    // Store into RAM 3-Point Limits Array
-    PW_CAL_LIMITS[ch][pt].center = center;
-    PW_CAL_LIMITS[ch][pt].lowLimit =
-        resLow.ok ? resLow.pw : ((pwSweepMode == PW_SWEEP_FULL) ? 0 : center);
-    PW_CAL_LIMITS[ch][pt].highLimit = resHigh.ok ? resHigh.pw : DIV_COUNTER_PW;
+PWSearchResult resHigh = find_pw_for_target_duty(
+    ch, targetHigh, dutyTol, 0, DIV_COUNTER_PW, seedHigh, (double)freqHz);
+uint16_t highLimit = resHigh.ok ? resHigh.pw : DIV_COUNTER_PW;
+
+// Store into RAM 3-Point Limits Array
+PW_CAL_LIMITS[ch][pt].center    = center;
+PW_CAL_LIMITS[ch][pt].lowLimit  = lowLimit;
+PW_CAL_LIMITS[ch][pt].highLimit = highLimit;
 
     // Capture Mid point (Point 1 / 440 Hz) metrics for summary reporting
     if (pt == 1) {
@@ -1562,12 +1517,12 @@ void run_pw_cv_probe() {
     if (PW_PINS[ch] == PW_PIN_UNASSIGNED)
       continue;
 
-      for (uint8_t z = 0; z < NUM_PW_CHANNELS; ++z) {
-        if (z != ch && PW_PINS[z] != PW_PIN_UNASSIGNED) {
-          voice_write_pw(z, 0);
-          PW[z] = 0;
+    for (uint8_t z = 0; z < NUM_PW_CHANNELS; ++z) {
+          if (z != ch && PW_PINS[z] != PW_PIN_UNASSIGNED) {
+            voice_write_pw(z, MUTE_PW_CHANNEL);
+            PW[z] = MUTE_PW_CHANNEL;
+          }
         }
-      }
       flush_voice_pwm();
 
     float dutyMin = 0.0f, dutyMax = 0.0f;
@@ -1612,8 +1567,12 @@ void DCO_calibration_debug() {
     double freqHz = (double)note_to_freq(DCO_calibration_current_note);
     if (freqHz > 0.0) {
       double periodUs = 1000000.0 / freqHz;
-      double gapUs =
-          (double)gm.value - (double)duty_trim_gap_us(reportDCO, (float)freqHz);
+      double gapUs = -((double)gm.value - (double)duty_trim_gap_us(reportDCO, (float)freqHz));
+      
+      if (osc_has_inverted_amp_duty(reportDCO)) {
+        gapUs = -gapUs;
+      }
+      
       double dutyErrorPercent = (gapUs / (2.0 * periodUs)) * 100.0;
       dutyErrorPercentTimes100 = (int32_t)(dutyErrorPercent * 100.0);
     }

@@ -350,6 +350,11 @@ float measure_duty_at_freq(float freqHz, uint16_t amp, bool hiRes) {
   gapGateFreqHz = 0.0f;
 
   float result = -(value - duty_trim_gap_us(currentDCO, freqHz));
+  
+  if (osc_has_inverted_amp_duty(currentDCO)) {
+    result = -result;
+  }
+
   if (autotuneDebug >= 2) {
     Serial.println((String)"  [FREQ_PROBE] DCO=" + currentDCO + " Freq=" + fmt_freq(freqHz) + "Hz" +
     " TargetAMP=" + amp + " (HW RangeCC=" + range_level_readback(currentDCO) +
@@ -564,7 +569,14 @@ static float scan_duty_at_freq(float freqHz, uint16_t amp) {
   GapMeasurement gm = measure_gap(3);
   gapGateFreqHz = 0.0f;
   if (gm.timedOut) return kGapTimeoutSentinel;
-  return -(gm.value - duty_trim_gap_us(currentDCO, freqHz));
+  
+  float result = -(gm.value - duty_trim_gap_us(currentDCO, freqHz));
+  
+  if (osc_has_inverted_amp_duty(currentDCO)) {
+    result = -result;
+  }
+  
+  return result;
 }
 
 static FreqSearchBounds amp0_prescan(FreqSearchBounds band, float fallbackHz, float *seedOut) {
@@ -738,6 +750,11 @@ static float measure_gap_for_amp(uint16_t ampPwm) {
   }
 
   float result = -(gm.value - duty_trim_gap_us(currentDCO, freqHz));
+  
+  if (osc_has_inverted_amp_duty(currentDCO)) {
+    result = -result;
+  }
+
   if (autotuneDebug >= 2) {
     double dutyErrPct = duty_err_pct_from_gap(result, freqHz);
     Serial.println((String)"  [AMP_PROBE] DCO=" + currentDCO + " TargetAMP=" + ampPwm +
