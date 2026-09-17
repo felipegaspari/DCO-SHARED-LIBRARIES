@@ -130,7 +130,6 @@ inline void apply_pw_center(uint8_t ch) {
   flush_voice_pwm();
 }
 
-// apply_pw_center_solo remains unchanged
 
 void apply_pw_baseline(uint8_t ch) {
 
@@ -144,24 +143,16 @@ void apply_pw_baseline(uint8_t ch) {
 }
 
 void apply_pw_center_solo(uint8_t soloCh) {
+  const uint16_t muteVal = (currentDCO & 1) ? 0 : MUTE_PW_CHANNEL;
   for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
     if (PW_PINS[ch] == PW_PIN_UNASSIGNED)
       continue;
     if (ch == soloCh) {
       apply_pw_center(ch);
     } else {
-      voice_write_pw(ch, MUTE_PW_CHANNEL);
-      PW[ch] = MUTE_PW_CHANNEL;
+      voice_write_pw(ch, muteVal);
+      PW[ch] = muteVal;
     }
-  }
-  flush_voice_pwm();
-}
-static void reset_pw_to_DIV_COUNTER_PW() {
-  for (int i = 0; i < NUM_PW_CHANNELS; i++) {
-    if (PW_PINS[i] == PW_PIN_UNASSIGNED)
-      continue;
-    voice_write_pw(i, DIV_COUNTER_PW);
-    PW[i] = DIV_COUNTER_PW;
   }
   flush_voice_pwm();
 }
@@ -200,11 +191,12 @@ static void disable_all_oscillators_and_range_pwm() {
   }
   
   const uint16_t muteVal = (currentDCO & 1) ? 0 : MUTE_PW_CHANNEL;
+  const bool hasPW = osc_has_pw(currentDCO);
   for (int i = 0; i < NUM_PW_CHANNELS; i++) {
     #ifndef RANGE0_PIO_DITHER_TEST
     gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
     #endif
-    if (i == cal_pw_channel(currentDCO)) {
+    if (hasPW && i == cal_pw_channel(currentDCO)) {
       voice_write_pw(i, DIV_COUNTER_PW / 2);
       PW[i] = DIV_COUNTER_PW / 2;
     } else {

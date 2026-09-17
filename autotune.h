@@ -57,10 +57,10 @@
 #define PIO_PARK_LEVEL_SAW 0u
 #endif
 #ifndef PIO_PARK_LEVEL_TRI
-#define PIO_PARK_LEVEL_TRI 0u
+#define PIO_PARK_LEVEL_TRI 1u
 #endif
 
-#define MUTE_PW_CHANNEL DIV_COUNTER_PW
+#define MUTE_PW_CHANNEL        DIV_COUNTER_PW   // automatica
 
 // Helper to determine if the oscillator requires inverted search directions
 static inline bool osc_has_inverted_amp_duty(uint8_t osc) {
