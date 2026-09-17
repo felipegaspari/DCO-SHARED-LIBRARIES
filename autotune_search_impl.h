@@ -1417,10 +1417,9 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
       }
     }
 
-    if (anchorAmp != storedAmp) {
-      ampComp440[ctx.dcoIndex] = anchorAmp;
-      update_FS_AmpComp440(ctx.dcoIndex, anchorAmp);
-    }
+    // El refinamiento vale solo para esta corrida: el ancla guardada es la
+    // de la calibracion manual y no se pisa.
+    (void)storedAmp;
   }
 
   // =========================================================================
