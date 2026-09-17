@@ -192,21 +192,25 @@ static void disable_all_oscillators_and_range_pwm() {
       pio_sm_set_enabled(pioN, sm, false);
       pio_sm_put(pioN, sm, 0);
       pio_sm_exec(pioN, sm, pio_encode_pull(false, false));
-      pio_sm_exec(pioN, sm, pio_encode_set(pio_pins, 0));
-      gpio_put(RESET_PINS[i], 1);
-      write_range_pwm(i, DIV_COUNTER); 
+
+      pio_park_osc_reset((uint8_t)i, osc_park_reset_level((uint8_t)i));
+
+      write_range_pwm(i, DIV_COUNTER);
     }
   }
   
+  const uint16_t muteVal = (currentDCO & 1) ? 0 : MUTE_PW_CHANNEL;
   for (int i = 0; i < NUM_PW_CHANNELS; i++) {
     #ifndef RANGE0_PIO_DITHER_TEST
     gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
     #endif
-    if (( i / 2) == currentDCO) {
-    voice_write_pw(i, DIV_COUNTER_PW / 2); 
+    if (i == cal_pw_channel(currentDCO)) {
+      voice_write_pw(i, DIV_COUNTER_PW / 2);
+      PW[i] = DIV_COUNTER_PW / 2;
     } else {
-      voice_write_pw(i, MUTE_PW_CHANNEL); // max voltage to drive integrator output low
-  }
+      voice_write_pw(i, muteVal);
+      PW[i] = muteVal;
+    }
   }
   // 2. Commit range muting to DMA immediately
   flush_voice_pwm();
@@ -258,7 +262,7 @@ static void disable_all_oscillators_and_range_pwm() {
 
   if (hasPW) {
     apply_pw_baseline_solo(pwCh);
-  }
+  } 
 
   delay(100);
 
@@ -292,12 +296,13 @@ static void disable_all_oscillators_and_range_pwm() {
 }
 
 void apply_pw_baseline_solo(uint8_t soloCh) {
+  const uint16_t muteVal = (currentDCO & 1) ? 0 : MUTE_PW_CHANNEL;
   for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ++ch) {
     if (ch == soloCh) {
       apply_pw_baseline(ch);
     } else {
-      voice_write_pw(ch, MUTE_PW_CHANNEL);
-      PW[ch] = MUTE_PW_CHANNEL;
+      voice_write_pw(ch, muteVal);
+      PW[ch] = muteVal;
     }
   }
   flush_voice_pwm();

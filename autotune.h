@@ -49,6 +49,17 @@
 #endif
 // =============================================================================
 
+// Nivel que deja la descarga ABIERTA -> la rampa sube al riel +.
+// Si te queda plana en 0 V, cambialo a 0u.
+#define PARK_LEVEL_OPEN 0u
+
+#ifndef PIO_PARK_LEVEL_SAW
+#define PIO_PARK_LEVEL_SAW 0u
+#endif
+#ifndef PIO_PARK_LEVEL_TRI
+#define PIO_PARK_LEVEL_TRI 0u
+#endif
+
 #define MUTE_PW_CHANNEL DIV_COUNTER_PW
 
 // Helper to determine if the oscillator requires inverted search directions
@@ -301,6 +312,24 @@ static inline const char *autotune_search_mode_name(uint8_t m) {
   if (m == SEARCH_GATED)
     return "GATED";
   return "INTERP";
+}
+
+// RESET_PINS[] se maneja por SIDE-SET, no por SET, asi que
+// pio_encode_set(pio_pins,x) no toca el pad. Forzamos el nivel a mano.
+// La SM tiene que estar deshabilitada antes de llamar.
+static inline void pio_park_osc_reset(uint8_t osc, uint level) {
+  PIO        pioN = pio[VOICE_TO_PIO[osc]];
+  const uint sm   = VOICE_TO_SM[osc];
+  const uint pin  = RESET_PINS[osc];
+  const uint32_t mask = 1u << pin;
+
+  pio_sm_set_consecutive_pindirs(pioN, sm, pin, 1, true);
+  pio_sm_set_pins_with_mask(pioN, sm, level ? mask : 0u, mask);
+}
+
+
+static inline uint osc_park_reset_level(uint8_t osc) {
+  return ((osc & 1u) == 0u) ? PIO_PARK_LEVEL_SAW : PIO_PARK_LEVEL_TRI;
 }
 
 static inline uint8_t cal_pw_channel(uint8_t osc) {
